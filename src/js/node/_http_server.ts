@@ -31,6 +31,7 @@ const kServerResponseStatistics = Symbol("ServerResponseStatistics");
 
 const { isPrimary } = require("internal/cluster/isPrimary");
 const { addServerAbortSignalOption } = require("internal/net/server_abort_signal");
+const { kSocketOptionHandle } = require("internal/net/symbols");
 const {
   kInternalSocketData,
   serverSymbol,
@@ -1638,6 +1639,13 @@ function onSocketTimeoutTimerExpired(socket) {
   socket._onTimeout();
 }
 
+// What carries a connection. resetAndDestroy() needs TCP, and a unix socket has no keep-alive.
+// A symbol and not a private field: as in Node.js, a Proxy of the socket can call the methods that read it.
+const kTransport = Symbol("kTransport");
+const kTransportTCP = 0;
+const kTransportTLS = 1;
+const kTransportUnix = 2;
+
 // Extends net.Socket so server connection sockets satisfy Node's class
 // contract (`req.socket instanceof net.Socket`); all I/O still goes through
 // the native NodeHTTP handle, not a net handle.
@@ -1678,6 +1686,7 @@ function getNodeHTTPServerSocket() {
     [kHandoffResponse] = undefined;
     [kDestroySoon] = false;
     [kHandedOff] = false;
+    [kTransport] = kTransportTCP;
     server: Server;
     _httpMessage;
     _secureEstablished = false;
@@ -1688,7 +1697,6 @@ function getNodeHTTPServerSocket() {
     #pendingAbortMessage;
     #closeHandled = false;
     #closingHandle;
-    #resetSupported;
     #closeError: Error | undefined = undefined;
     declare encrypted: boolean;
     declare resetAndClosing: boolean;
@@ -1712,7 +1720,7 @@ function getNodeHTTPServerSocket() {
       this._readableState.emitClose = true;
       this._writableState.decodeStrings = true;
       this.server = server;
-      this.#resetSupported = !encrypted && !listenerGeneration?.isUnix;
+      this[kTransport] = listenerGeneration?.isUnix ? kTransportUnix : encrypted ? kTransportTLS : kTransportTCP;
       this[kHandle] = handle;
       this._secureEstablished = !!handle?.secureEstablished;
       handle.onclose = this.#onClose.bind(this);
@@ -2131,7 +2139,7 @@ function getNodeHTTPServerSocket() {
 
     resetAndDestroy() {
       if (this[kHandle]) {
-        if (!this.#resetSupported) {
+        if (this[kTransport] !== kTransportTCP) {
           throw $ERR_INVALID_HANDLE_TYPE();
         }
         this.resetAndClosing = true;
@@ -2142,8 +2150,9 @@ function getNodeHTTPServerSocket() {
       return this;
     }
 
-    setKeepAlive(_enable = false, _initialDelay = 0) {
-      return this;
+    // What net.Socket#setKeepAlive() acts on. A unix socket has no keep-alive, as node's Pipe handle.
+    get [kSocketOptionHandle]() {
+      return this[kTransport] === kTransportUnix ? undefined : this[kHandle];
     }
 
     setNoDelay(_noDelay = true) {
