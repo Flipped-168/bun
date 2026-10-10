@@ -2246,6 +2246,9 @@ declare module "bun" {
       /**
        * Set the file permissions of the destination when it is created or overwritten.
        *
+       * On POSIX systems, Bun sets the mode of a regular file only. It does not change
+       * the mode of a FIFO, a device or a terminal that already exists at the destination.
+       *
        * Must be a valid Unix permission mode (0 to 0o777 / 511 in decimal).
        * If omitted, defaults to the system default based on umask (typically 0o644).
        *
@@ -2291,6 +2294,9 @@ declare module "bun" {
     options?: {
       /**
        * Set the file permissions of the destination when it is created or overwritten.
+       *
+       * On POSIX systems, Bun sets the mode of a regular file only. It does not change
+       * the mode of a FIFO, a device or a terminal that already exists at the destination.
        *
        * Must be a valid Unix permission mode (0 to 0o777 / 511 in decimal).
        * If omitted, defaults to the system default based on umask (typically 0o644).
