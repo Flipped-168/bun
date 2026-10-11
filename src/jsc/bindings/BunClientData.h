@@ -79,6 +79,7 @@ class DOMWrapperWorld;
 namespace Zig {
 class GlobalObject;
 }
+class VersionSqlite3;
 
 namespace Bun {
 class StrongRootBlock;
@@ -350,6 +351,7 @@ private:
     Bun::HeapSizeAfterLastCollection m_heapSizeAfterLastCollection;
 
     SentinelLinkedList<JSVMClientDataClient, BasicRawSentinelNode<JSVMClientDataClient>> m_clients;
+    Vector<VersionSqlite3*> m_sqliteDatabases;
     bool m_isWorkerVM { false };
     bool m_isNodeWorkerVM { false };
 
@@ -360,6 +362,13 @@ public:
     bool isNodeWorkerVM() const { return m_isNodeWorkerVM; }
     // VM thread. Unlinking is the client's own (`remove()` in its destructor).
     void addClient(JSVMClientDataClient& client) { m_clients.append(&client); }
+    // The bun:sqlite connection records this VM opened (JSSQLStatement.cpp); a record removes itself in its destructor.
+    Vector<VersionSqlite3*>& sqliteDatabases(JSC::VM& vm)
+    {
+        ASSERT(vm.clientData == this);
+        ASSERT(vm.currentThreadIsHoldingAPILock());
+        return m_sqliteDatabases;
+    }
 };
 
 } // namespace WebCore
