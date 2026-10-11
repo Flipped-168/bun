@@ -15,6 +15,7 @@ const {
   validateLinkHeaderValue,
   validateBoolean,
   validateInteger,
+  validateNumber,
   validateFunction,
   validateOneOf,
 } = require("internal/validators");
@@ -300,6 +301,8 @@ interface Server extends NodeHTTPServer {
   requireHostHeader: boolean;
   httpAllowHalfOpen: boolean;
   blockList?: import("node:net").BlockList;
+  keepAlive: boolean;
+  keepAliveInitialDelay: number;
 }
 function Server(options, callback): void {
   if (!(this instanceof Server)) return new Server(options, callback);
@@ -438,6 +441,15 @@ function Server(options, callback): void {
 
   this[optionsSymbol] = options;
   storeHTTPOptions.$call(this, options);
+
+  // Node's net.Server checks keepAliveInitialDelay and keeps it in seconds: https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L1850-L1858 and https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L1881-L1882
+  let keepAliveInitialDelay = options.keepAliveInitialDelay;
+  if (keepAliveInitialDelay !== undefined) {
+    validateNumber(keepAliveInitialDelay, "options.keepAliveInitialDelay");
+    if (keepAliveInitialDelay < 0) keepAliveInitialDelay = 0;
+  }
+  this.keepAlive = Boolean(options.keepAlive);
+  this.keepAliveInitialDelay = ~~(keepAliveInitialDelay / 1000);
 
   if (callback) this.on("request", callback);
   return this;
@@ -766,6 +778,7 @@ Server.prototype[kRealListen] = function (tls, port, host, socketPath, reusePort
       ) {
         if (!socket) {
           socket = new (getNodeHTTPServerSocket())(server, socketHandle, !!tls, listenerGeneration);
+          if (server.keepAlive) setKeepAliveOfServer(server, socket, !!tls);
         }
 
         if (isPipelinedDispatch) {
@@ -1254,6 +1267,17 @@ function defineMaxHeadersCount(server: Server) {
   });
 }
 
+// Node's net.Server gives keep-alive to each connection it accepts, from the two properties as they are then: https://github.com/nodejs/node/blob/v26.3.0/lib/net.js#L2361-L2365
+function setKeepAliveOfServer(server: Server, socket: NodeHTTPServerSocket, isTLS: boolean) {
+  // Node gives the seconds to the handle as an unsigned int. setKeepAlive() takes milliseconds.
+  const seconds = server.keepAliveInitialDelay;
+  const delay = (typeof seconds === "number" ? seconds >>> 0 : 0) * 1000;
+  // Node's https req.socket is a TLSSocket, which starts with no keep-alive state: its setKeepAlive(false) does nothing.
+  // So on https the handle alone gets the call. On http the socket starts from it, as Node's net.Socket.
+  if (isTLS) socket[kSocketOptionHandle]?.setKeepAlive(true, delay);
+  else socket.setKeepAlive(true, delay);
+}
+
 // Native callback fired when the server accepts a connection (for TLS, when
 // its handshake completes), before any request bytes - like Node.js's
 // net.Server 'connection' / tls.Server 'secureConnection' events.
@@ -1303,6 +1327,8 @@ function onServerConnection(this: Server, listenerGeneration, socketHandle) {
       if (blocked) return;
     }
   }
+
+  if (this.keepAlive) setKeepAliveOfServer(this, socket, isTLS);
 
   // Node's connectionListener attaches the HTTPParser (socket.parser) before
   // emitting 'connection'; expose the shim here so listeners see it populated.
@@ -1380,6 +1406,7 @@ function onServerClientError(
   const existingDuplex = (socket as any).duplex;
   const nodeSocket = existingDuplex ?? new (getNodeHTTPServerSocket())(self, socket, ssl, listenerGeneration);
   if (!existingDuplex) {
+    if (self.keepAlive) setKeepAliveOfServer(self, nodeSocket, ssl);
     nodeSocket.parser = createServerParserShim(nodeSocket);
     self.emit("connection", nodeSocket);
   }

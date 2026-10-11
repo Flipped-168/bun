@@ -1,10 +1,11 @@
 /**
- * TCP keep-alive of a node:http server: socket.setKeepAlive() of the sockets the server gives to its listeners.
+ * TCP keep-alive of a node:http server: the `keepAlive` and `keepAliveInitialDelay` options of createServer(), and
+ * socket.setKeepAlive() of the sockets the server gives to its listeners.
  *
- * The first block runs in both Bun and Node.js: `bun test` runs it here, and the last test runs this same file
- * under Node.js. The other blocks read the socket options of the kernel with bun:ffi, so they run in Bun only. Their
- * expected values are what Node v26.3.0 gives (read there with getsockopt(2) from a helper process), except where a
- * comment says that Bun differs.
+ * The first two blocks run in both Bun and Node.js: `bun test` runs them here, and the last test runs this same
+ * file under Node.js. The other blocks read the socket options of the kernel with bun:ffi, so they run in Bun only.
+ * Their expected values are what Node v26.3.0 gives (read there with getsockopt(2) from a helper process), except
+ * where a comment says that Bun differs.
  */
 import assert from "node:assert";
 import { once } from "node:events";
@@ -69,6 +70,86 @@ async function withSocket<T>(
     server.close();
   }
 }
+
+type KeepAliveProperties = { keepAlive: unknown; keepAliveInitialDelay: unknown };
+const keepAliveOf = (server: http.Server) => {
+  const { keepAlive, keepAliveInitialDelay } = server as unknown as KeepAliveProperties;
+  return [keepAlive, keepAliveInitialDelay];
+};
+
+describe("server.keepAlive and server.keepAliveInitialDelay", () => {
+  // [options, [keepAlive, keepAliveInitialDelay]]. The delay is an option in milliseconds and a property in seconds.
+  const rows: [string, http.ServerOptions | undefined, unknown[]][] = [
+    ["no options", undefined, [false, 0]],
+    ["{}", {}, [false, 0]],
+    ["{ keepAlive: true }", { keepAlive: true }, [true, 0]],
+    [
+      "{ keepAlive: 1, keepAliveInitialDelay: 30000 }",
+      { keepAlive: 1 as any, keepAliveInitialDelay: 30000 },
+      [true, 30],
+    ],
+    ["{ keepAlive: true, keepAliveInitialDelay: 1500 }", { keepAlive: true, keepAliveInitialDelay: 1500 }, [true, 1]],
+    ["{ keepAlive: true, keepAliveInitialDelay: -5000 }", { keepAlive: true, keepAliveInitialDelay: -5000 }, [true, 0]],
+    ["{ keepAlive: true, keepAliveInitialDelay: NaN }", { keepAlive: true, keepAliveInitialDelay: NaN }, [true, 0]],
+    [
+      "{ keepAlive: true, keepAliveInitialDelay: Infinity }",
+      { keepAlive: true, keepAliveInitialDelay: Infinity },
+      [true, 0],
+    ],
+    [
+      "{ keepAlive: true, keepAliveInitialDelay: 2 ** 40 }",
+      { keepAlive: true, keepAliveInitialDelay: 2 ** 40 },
+      [true, 1099511627],
+    ],
+    ["{ keepAliveInitialDelay: 5000 }", { keepAliveInitialDelay: 5000 }, [false, 5]],
+  ];
+  for (const [label, options, expected] of rows) {
+    test(`every way to make a server: ${label}`, () => {
+      assert.deepStrictEqual(
+        {
+          "http.createServer()": keepAliveOf(http.createServer(options as http.ServerOptions)),
+          "new http.Server()": keepAliveOf(new http.Server(options as http.ServerOptions)),
+          // @ts-expect-error http.Server() without `new`
+          "http.Server()": keepAliveOf(http.Server(options)),
+          "https.createServer()": keepAliveOf(https.createServer(options as https.ServerOptions)),
+        },
+        {
+          "http.createServer()": expected,
+          "new http.Server()": expected,
+          "http.Server()": expected,
+          "https.createServer()": expected,
+        },
+      );
+    });
+  }
+
+  test("a keepAliveInitialDelay that is not a number throws ERR_INVALID_ARG_TYPE", () => {
+    assert.throws(() => http.createServer({ keepAlive: true, keepAliveInitialDelay: "5" as any }), {
+      name: "TypeError",
+      code: "ERR_INVALID_ARG_TYPE",
+      message: `The "options.keepAliveInitialDelay" property must be of type number. Received type string ('5')`,
+    });
+    assert.throws(() => https.createServer({ keepAliveInitialDelay: null as any }), {
+      name: "TypeError",
+      code: "ERR_INVALID_ARG_TYPE",
+      message: `The "options.keepAliveInitialDelay" property must be of type number. Received null`,
+    });
+  });
+
+  test("the two are own enumerable data properties", () => {
+    const server = http.createServer({ keepAlive: true, keepAliveInitialDelay: 5000 });
+    assert.deepStrictEqual(
+      [
+        Object.getOwnPropertyDescriptor(server, "keepAlive"),
+        Object.getOwnPropertyDescriptor(server, "keepAliveInitialDelay"),
+      ],
+      [
+        { value: true, writable: true, enumerable: true, configurable: true },
+        { value: 5, writable: true, enumerable: true, configurable: true },
+      ],
+    );
+  });
+});
 
 describe("socket.setKeepAlive() of a server socket", () => {
   test("returns a Proxy of the socket that it is called on", async () => {
@@ -401,6 +482,277 @@ if (typeof Bun !== "undefined") {
     });
   });
 
+  describe("SO_KEEPALIVE of a connection of a server with keepAlive", { skip: isWindows }, () => {
+    const options = { keepAlive: true, keepAliveInitialDelay: 30000 };
+    const thirty = { keepAlive: true, keepIdle: 30 };
+
+    // Changes the time of the kernel behind the back of the socket: a later call that reaches the kernel changes it again.
+    function setKeepIdle(ports: Ports, seconds: number) {
+      if (symbols().setsockopt(fdOf(ports), IPPROTO_TCP, TCP_KEEPIDLE, ptr(new Int32Array([seconds])), 4) !== 0) {
+        throw new Error("setsockopt(TCP_KEEPIDLE) failed");
+      }
+    }
+
+    for (const secure of [false, true]) {
+      test(`${secure ? "https" : "http"}: the connection has the options when 'connection' runs`, async () => {
+        const accepted = await withSocket(createServer(secure, options), secure, "connection", kernelKeepAlive);
+        assert.deepStrictEqual(accepted, thirty);
+      });
+    }
+
+    test("the delay is for keepAlive only, and one under a second keeps the time of the kernel", async () => {
+      const accepted = (options: http.ServerOptions) =>
+        withSocket(http.createServer(options), false, "connection", kernelKeepAlive);
+      const [{ keepIdle }, ...withOptions] = await Promise.all([
+        accepted({}),
+        accepted({ keepAlive: true }),
+        accepted({ keepAlive: true, keepAliveInitialDelay: 500 }),
+        accepted({ keepAliveInitialDelay: 5000 }),
+      ]);
+      assert.deepStrictEqual(withOptions, [
+        { keepAlive: true, keepIdle },
+        { keepAlive: true, keepIdle },
+        { keepAlive: false, keepIdle },
+      ]);
+    });
+
+    test("http: setKeepAlive() starts from the options of the server", async () => {
+      const off = await withSocket(createServer(false, options), false, "request", socket => {
+        socket.setKeepAlive(false);
+        return kernelKeepAlive(socket).keepAlive;
+      });
+      const on = await withSocket(createServer(false, options), false, "request", socket => {
+        setKeepIdle(socket, 77);
+        // The values of the options: the call must not reach the kernel.
+        socket.setKeepAlive(true, 30000);
+        const same = kernelKeepAlive(socket);
+        socket.setKeepAlive(true, 5000);
+        return { same, changed: kernelKeepAlive(socket) };
+      });
+      assert.deepStrictEqual(
+        { off, ...on },
+        { off: false, same: { keepAlive: true, keepIdle: 77 }, changed: { keepAlive: true, keepIdle: 5 } },
+      );
+    });
+
+    // Node's req.socket of an https server is a TLSSocket. The server gave keep-alive to the net.Socket below it.
+    test("https: setKeepAlive() starts from nothing, as Node's TLSSocket", async () => {
+      const off = await withSocket(createServer(true, options), true, "request", socket => {
+        // Off is what the socket already has, so the call does not reach the kernel.
+        socket.setKeepAlive(false);
+        return kernelKeepAlive(socket);
+      });
+      const on = await withSocket(createServer(true, options), true, "request", socket => {
+        setKeepIdle(socket, 77);
+        socket.setKeepAlive(true, 30000);
+        return kernelKeepAlive(socket);
+      });
+      assert.deepStrictEqual({ off, on }, { off: thirty, on: thirty });
+    });
+
+    test("an assignment to the properties is for the connections after it, also after a new listen()", async () => {
+      const server = http.createServer((_req, res) => res.end());
+      const properties = server as unknown as KeepAliveProperties;
+      const clients: net.Socket[] = [];
+      // The next socket that the server accepts.
+      const accept = async (port: number) => {
+        const connection = once(server, "connection") as Promise<[net.Socket]>;
+        clients.push(await connect(port, false, requests.request));
+        return (await connection)[0];
+      };
+      try {
+        properties.keepAlive = true;
+        properties.keepAliveInitialDelay = 7;
+        let port = await listen(server);
+        const first = await accept(port);
+        const beforeListen = kernelKeepAlive(first);
+
+        properties.keepAliveInitialDelay = 9;
+        const second = await accept(port);
+        const afterListen = { second: kernelKeepAlive(second), first: kernelKeepAlive(first) };
+        // The socket starts from the 9 seconds: the same values do not reach the kernel.
+        setKeepIdle(second, 77);
+        second.setKeepAlive(true, 9000);
+        const sameAsAssigned = kernelKeepAlive(second);
+
+        for (const client of clients) client.destroy();
+        server.closeAllConnections();
+        server.close();
+        await once(server, "close");
+        port = await listen(server);
+        const afterNewListen = kernelKeepAlive(await accept(port));
+
+        properties.keepAlive = false;
+        const off = kernelKeepAlive(await accept(port)).keepAlive;
+
+        assert.deepStrictEqual(
+          { beforeListen, afterListen, sameAsAssigned, afterNewListen, off },
+          {
+            beforeListen: { keepAlive: true, keepIdle: 7 },
+            afterListen: { second: { keepAlive: true, keepIdle: 9 }, first: { keepAlive: true, keepIdle: 7 } },
+            sameAsAssigned: { keepAlive: true, keepIdle: 77 },
+            afterNewListen: { keepAlive: true, keepIdle: 9 },
+            off: false,
+          },
+        );
+      } finally {
+        for (const client of clients) client.destroy();
+        server.closeAllConnections();
+        server.close();
+      }
+    });
+
+    test("a class field, and Object.defineProperty() after listen(), give the values", async () => {
+      class KeepAliveServer extends http.Server {
+        keepAlive = true;
+        keepAliveInitialDelay = 7;
+      }
+      const field = await withSocket(new KeepAliveServer(), false, "connection", kernelKeepAlive);
+
+      const server = http.createServer((_req, res) => res.end());
+      const port = await listen(server);
+      Object.defineProperty(server, "keepAlive", { value: true });
+      Object.defineProperty(server, "keepAliveInitialDelay", { value: 8 });
+      const connection = once(server, "connection") as Promise<[net.Socket]>;
+      const client = await connect(port, false, requests.request);
+      try {
+        const defined = kernelKeepAlive((await connection)[0]);
+        assert.deepStrictEqual(
+          { field, defined },
+          { field: { keepAlive: true, keepIdle: 7 }, defined: { keepAlive: true, keepIdle: 8 } },
+        );
+      } finally {
+        client.destroy();
+        server.closeAllConnections();
+        server.close();
+      }
+    });
+
+    test("an assigned keepAliveInitialDelay that is not a number keeps the time of the kernel", async () => {
+      const server = http.createServer((_req, res) => res.end());
+      const properties = server as unknown as KeepAliveProperties;
+      properties.keepAlive = true;
+      const port = await listen(server);
+      const clients: net.Socket[] = [];
+      // The keep-alive of the next connection, accepted with `delay` as the property.
+      const accepted = async (delay: unknown) => {
+        properties.keepAliveInitialDelay = delay;
+        const connection = once(server, "connection") as Promise<[net.Socket]>;
+        clients.push(await connect(port, false, requests.request));
+        return kernelKeepAlive((await connection)[0]);
+      };
+      const throws = {
+        valueOf() {
+          throw new Error("valueOf");
+        },
+      };
+      try {
+        const { keepIdle } = await accepted(0);
+        const kernel = { keepAlive: true, keepIdle };
+        const results: unknown[] = [];
+        for (const delay of [7, 7.9, NaN, "7", 5n, Symbol("delay"), throws, null, undefined, {}]) {
+          results.push(await accepted(delay));
+        }
+        assert.deepStrictEqual(results, [
+          { keepAlive: true, keepIdle: 7 },
+          { keepAlive: true, keepIdle: 7 },
+          kernel,
+          kernel,
+          kernel,
+          kernel,
+          kernel,
+          kernel,
+          kernel,
+          kernel,
+        ]);
+      } finally {
+        for (const client of clients) client.destroy();
+        server.closeAllConnections();
+        server.close();
+      }
+    });
+
+    for (const secure of [false, true]) {
+      test(`${secure ? "https" : "http"}: a unix listener does not set it, as in Node.js`, async () => {
+        using dir = tempDir("sock", {});
+        const path = join(String(dir), "http.sock");
+        const server = createServer(secure, options);
+        server.on("request", (_req, res) => res.end());
+        server.listen(path);
+        await once(server, "listening");
+        const connection = once(server, "connection");
+        const client = secure ? tls.connect({ path, rejectUnauthorized: false }) : net.connect(path);
+        try {
+          client.write(requests.request);
+          await Promise.race([connection, once(client, "error").then(([error]) => Promise.reject(error))]);
+          assert.strictEqual(intOption(fdOfUnixConnection(path), SOL_SOCKET, SO_KEEPALIVE) !== 0, false);
+        } finally {
+          client.destroy();
+          server.closeAllConnections();
+          server.close();
+        }
+      });
+    }
+
+    // Keep-alive is per listener, and off. TCP_NODELAY stays on for every connection: the `noDelay` option and
+    // socket.setNoDelay(false) have no effect on a server socket.
+    test("other listeners do not set it, and every connection has TCP_NODELAY on", async () => {
+      const optionsOf = (ports: Ports) => {
+        const fd = fdOf(ports);
+        if (fd === -1) throw new Error(`no connection from port ${ports.remotePort} to port ${ports.localPort}`);
+        return {
+          keepAlive: intOption(fd, SOL_SOCKET, SO_KEEPALIVE) !== 0,
+          noDelay: intOption(fd, IPPROTO_TCP, TCP_NODELAY) !== 0,
+        };
+      };
+      const served = Promise.withResolvers<Ports>();
+      using server = Bun.serve({
+        port: 0,
+        hostname: "127.0.0.1",
+        fetch(request, server) {
+          served.resolve({ localPort: server.port, remotePort: server.requestIP(request)!.port });
+          return new Response();
+        },
+      });
+      const listened = Promise.withResolvers<Ports>();
+      using listener = Bun.listen({
+        port: 0,
+        hostname: "127.0.0.1",
+        socket: {
+          open: socket => listened.resolve({ localPort: socket.localPort, remotePort: socket.remotePort }),
+          data() {},
+        },
+      });
+      const clients = [await connect(server.port!, false, requests.request), await connect(listener.port, false, "")];
+      try {
+        assert.deepStrictEqual(
+          {
+            "Bun.serve()": optionsOf(await served.promise),
+            "Bun.listen()": optionsOf(await listened.promise),
+            "http.createServer()": await withSocket(http.createServer(), false, "connection", optionsOf),
+            "http.createServer({ keepAlive: true, noDelay: false })": await withSocket(
+              http.createServer({ keepAlive: true, noDelay: false }),
+              false,
+              "request",
+              socket => {
+                socket.setNoDelay(false);
+                return optionsOf(socket);
+              },
+            ),
+          },
+          {
+            "Bun.serve()": { keepAlive: false, noDelay: true },
+            "Bun.listen()": { keepAlive: false, noDelay: true },
+            "http.createServer()": { keepAlive: false, noDelay: true },
+            "http.createServer({ keepAlive: true, noDelay: false })": { keepAlive: true, noDelay: true },
+          },
+        );
+      } finally {
+        for (const client of clients) client.destroy();
+      }
+    });
+  });
+
   describe("socket.setKeepAlive() on a connection that the server just closed", () => {
     test("returns the socket", async () => {
       const accepted = Promise.withResolvers<net.Socket>();
@@ -430,7 +782,7 @@ if (typeof Bun !== "undefined") {
 
   describe("Node.js compatibility", () => {
     const node = nodeExe();
-    (node ? test : test.skip)("the tests of the first block pass in Node.js", async () => {
+    (node ? test : test.skip)("the tests of the first two blocks pass in Node.js", async () => {
       // A direct run, not `node --test`: the runner mode forks a second node
       // process per file. node:test still exits non-zero on any failure.
       await using proc = Bun.spawn({
