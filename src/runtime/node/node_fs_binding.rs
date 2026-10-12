@@ -430,6 +430,71 @@ impl Binding {
     // pub const statfsSync = callSync(.statfs);
 }
 
+// The operations of `fs.Dir` on its native stream, in the arms `fs.Dir` uses.
+impl Binding {
+    pub(crate) const opendir_sync: NodeFSFunction =
+        call_sync::<ret::Opendir, args::Opendir<'static>, { NodeFSFunctionEnum::Opendir }>();
+    pub(crate) const dir_read_sync: NodeFSFunction =
+        call_sync::<ret::DirRead, args::DirRead, { NodeFSFunctionEnum::DirRead }>();
+    pub(crate) const dir_close_sync: NodeFSFunction =
+        call_sync::<ret::DirClose, args::DirClose, { NodeFSFunctionEnum::DirClose }>();
+
+    pub(crate) fn opendir_cb(
+        this: &Self,
+        global: &JSGlobalObject,
+        frame: &CallFrame,
+    ) -> JsResult<JSValue> {
+        run_async::<args::Opendir<'static>>(
+            this,
+            global,
+            frame,
+            AsyncArm::Callback,
+            async_::Opendir::create,
+        )
+    }
+
+    /// Entries that the stream already holds resolve at once. Only a read that reaches the OS is a work-pool job.
+    pub(crate) fn dir_read(
+        this: &Self,
+        global: &JSGlobalObject,
+        frame: &CallFrame,
+    ) -> JsResult<JSValue> {
+        let args = match parse_async_args::<args::DirRead>(global, frame.arguments())? {
+            ParsedAsyncArgs::Args(args) => args,
+            ParsedAsyncArgs::Rejected(error) => return reject_before_schedule(global, None, error),
+        };
+        // An error is left to the job, which reports it as every other read's.
+        if let Ok(Some(batch)) = args.stream.read(args.limit, false) {
+            return Ok(JSPromise::resolved_promise_value(
+                global,
+                batch.into_js(global)?,
+            ));
+        }
+        let vm: &mut VirtualMachine = global.bun_vm().as_mut();
+        Ok(async_::DirRead::create(
+            &global.js_thread_of_caller(frame),
+            this,
+            args,
+            vm,
+            None,
+        ))
+    }
+
+    pub(crate) fn dir_close(
+        this: &Self,
+        global: &JSGlobalObject,
+        frame: &CallFrame,
+    ) -> JsResult<JSValue> {
+        run_async::<args::DirClose>(
+            this,
+            global,
+            frame,
+            AsyncArm::Promise,
+            async_::DirClose::create,
+        )
+    }
+}
+
 pub(crate) fn create_binding(global: &JSGlobalObject) -> JSValue {
     let module = Binding::new(Binding::default());
 

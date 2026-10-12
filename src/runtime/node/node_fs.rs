@@ -213,6 +213,7 @@ pub(crate) use super::node_fs_binding::Binding;
 use bun_jsc::JSPromiseStrong;
 
 use super::dir_iterator as DirIterator;
+use super::node_fs_dir::{DirStream, Stream as DirStreamState};
 #[cfg(not(windows))]
 use bun_resolver::fs::FileSystem;
 
@@ -346,7 +347,7 @@ fn with_path_like(err: sys::Error, p: &PathOrFileDescriptor) -> sys::Error {
 /// against the upstream copy, so adapt at the boundary instead of changing
 /// either definition.
 #[inline]
-fn encoding_to_node(e: Encoding) -> bun_core::NodeEncoding {
+pub(super) fn encoding_to_node(e: Encoding) -> bun_core::NodeEncoding {
     use bun_core::NodeEncoding as N;
     match e {
         Encoding::Utf8 => N::Utf8,
@@ -528,6 +529,12 @@ mod _async_tasks {
             AsyncFSTask<ret::Mkdtemp, args::MkdirTemp<'static>, { NodeFSFunctionEnum::Mkdtemp }>;
         pub(crate) type Open =
             UVFSRequest<ret::Open, args::Open<'static>, { NodeFSFunctionEnum::Open }>;
+        pub(crate) type Opendir =
+            AsyncFSTask<ret::Opendir, args::Opendir<'static>, { NodeFSFunctionEnum::Opendir }>;
+        pub(crate) type DirRead =
+            AsyncFSTask<ret::DirRead, args::DirRead, { NodeFSFunctionEnum::DirRead }>;
+        pub(crate) type DirClose =
+            AsyncFSTask<ret::DirClose, args::DirClose, { NodeFSFunctionEnum::DirClose }>;
         pub(crate) type Read = UVFSRequest<ret::Read, args::Read, { NodeFSFunctionEnum::Read }>;
         pub(crate) type Readdir =
             AsyncFSTask<ret::Readdir, args::Readdir<'static>, { NodeFSFunctionEnum::Readdir }>;
@@ -1044,6 +1051,7 @@ mod _async_tasks {
         args::Mkdir<'static>,
         args::MkdirTemp<'static>,
         args::Readdir<'static>,
+        args::Opendir<'static>,
         args::Open<'static>,
         args::Exists<'static>,
         args::Access<'static>,
@@ -1062,6 +1070,8 @@ mod _async_tasks {
         args::FdataSync,
         args::Fsync,
         args::Close,
+        args::DirRead,
+        args::DirClose,
     );
     // `ReadFile`/`WriteFile` carry an `AbortSignal` field — opt them in so the
     // `const _ = assert!(…::HAVE_ABORT_SIGNAL)` invariants in `async_` hold and
@@ -1200,6 +1210,19 @@ mod _async_tasks {
         #[inline]
         fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
             self.to_js_newly_created(global)
+        }
+    }
+    /// A stream nobody takes is dropped: that closes the directory.
+    impl FsReturn for ret::Opendir {
+        #[inline]
+        fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
+            Ok(DirStream::create(self.0, global))
+        }
+    }
+    impl FsReturn for ret::DirRead {
+        #[inline]
+        fn fs_to_js(self, global: &JSGlobalObject) -> JsResult<JSValue> {
+            self.into_js(global)
         }
     }
 
@@ -3605,6 +3628,74 @@ pub(crate) mod args {
         }
     }
 
+    pub(crate) struct Opendir<'a> {
+        pub path: PathLike<'a>,
+        pub(crate) encoding: Encoding,
+        pub(crate) recursive: bool,
+    }
+    impl Opendir<'static> {
+        pub(crate) fn from_js(
+            ctx: &JSGlobalObject,
+            arguments: &mut ArgumentsSlice,
+        ) -> JsResult<Self> {
+            let path = PathLike::from_js_required(ctx, arguments, "path")?;
+            let encoding = match arguments.next_eat() {
+                Some(value) => Encoding::assert(value, ctx, Encoding::Utf8)?,
+                None => Encoding::Utf8,
+            };
+            let recursive = arguments.next_eat().is_some_and(JSValue::to_boolean);
+            Ok(Opendir {
+                path,
+                encoding,
+                recursive,
+            })
+        }
+    }
+
+    /// The stream of the `DirStream` wrapper that `fs.Dir` passes.
+    fn dir_stream_from_js(
+        ctx: &JSGlobalObject,
+        arguments: &mut ArgumentsSlice,
+    ) -> JsResult<std::sync::Arc<DirStreamState>> {
+        let value = arguments.next_eat().unwrap_or(JSValue::UNDEFINED);
+        DirStream::stream_from_js(value)
+            .ok_or_else(|| ctx.throw_invalid_argument_type_value("handle", "DirStream", value))
+    }
+
+    pub(crate) struct DirRead {
+        pub(crate) stream: std::sync::Arc<DirStreamState>,
+        /// The most entries to give: the `bufferSize` of the `fs.Dir`.
+        pub(crate) limit: u32,
+    }
+    impl DirRead {
+        pub(crate) fn from_js(
+            ctx: &JSGlobalObject,
+            arguments: &mut ArgumentsSlice,
+        ) -> JsResult<DirRead> {
+            let stream = dir_stream_from_js(ctx, arguments)?;
+            let limit = match arguments.next_eat().and_then(JSValue::get_number) {
+                Some(limit) if limit >= u32::MAX as f64 => u32::MAX,
+                Some(limit) if limit >= 1.0 => limit as u32,
+                _ => 1,
+            };
+            Ok(DirRead { stream, limit })
+        }
+    }
+
+    pub(crate) struct DirClose {
+        pub(crate) stream: std::sync::Arc<DirStreamState>,
+    }
+    impl DirClose {
+        pub(crate) fn from_js(
+            ctx: &JSGlobalObject,
+            arguments: &mut ArgumentsSlice,
+        ) -> JsResult<DirClose> {
+            Ok(DirClose {
+                stream: dir_stream_from_js(ctx, arguments)?,
+            })
+        }
+    }
+
     pub(crate) struct Close {
         pub(crate) fd: FD,
     }
@@ -4537,6 +4628,9 @@ pub(crate) mod ret {
     pub(crate) type Mkdir = StringOrUndefined;
     pub(crate) type Mkdtemp = StringOrBuffer<'static>;
     pub(crate) type Open = FD;
+    pub(crate) struct Opendir(pub(crate) std::sync::Arc<DirStreamState>);
+    pub(crate) type DirRead = super::super::node_fs_dir::DirBatch;
+    pub(crate) type DirClose = ();
     pub(crate) type WriteFile = ();
     pub(crate) type Readv = Read;
     pub(crate) type StatFS = node::StatFS;
@@ -6299,6 +6393,23 @@ impl NodeFS {
         Ok(ret::Write {
             bytes_written: total,
         })
+    }
+
+    pub(crate) fn opendir(&mut self, args: &args::Opendir, _: Flavor) -> Maybe<ret::Opendir> {
+        let path = args.path.slice_z(&mut self.sync_error_buf);
+        DirStreamState::open(args.path.slice(), path, args.encoding, args.recursive)
+            .map(ret::Opendir)
+    }
+
+    pub(crate) fn dir_read(&mut self, args: &args::DirRead, _: Flavor) -> Maybe<ret::DirRead> {
+        args.stream
+            .read(args.limit, true)
+            .map(|batch| batch.expect("a read that may use the OS gives a batch"))
+    }
+
+    pub(crate) fn dir_close(&mut self, args: &args::DirClose, _: Flavor) -> Maybe<ret::DirClose> {
+        args.stream.close();
+        Ok(())
     }
 
     pub(crate) fn readdir(&mut self, args: &args::Readdir, flavor: Flavor) -> Maybe<ret::Readdir> {
@@ -9198,6 +9309,9 @@ node_fs_ops! {
     Mkdir => mkdir, args::Mkdir<'static>, ret::Mkdir;
     Mkdtemp => mkdtemp, args::MkdirTemp<'static>, ret::Mkdtemp;
     Open => open, args::Open<'static>, ret::Open, uv = uv_open;
+    Opendir => opendir, args::Opendir<'static>, ret::Opendir;
+    DirRead => dir_read, args::DirRead, ret::DirRead;
+    DirClose => dir_close, args::DirClose, ret::DirClose;
     Read => read, args::Read, ret::Read, uv = uv_read;
     Readdir => readdir, args::Readdir<'static>, ret::Readdir;
     ReadFile => read_file, args::ReadFile<'static>, ret::ReadFile;
@@ -10060,6 +10174,9 @@ pub(crate) enum NodeFSFunctionEnum {
     Mkdir,
     Mkdtemp,
     Open,
+    Opendir,
+    DirRead,
+    DirClose,
     Read,
     Readdir,
     ReadFile,

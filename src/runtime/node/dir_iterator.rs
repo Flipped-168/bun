@@ -107,13 +107,18 @@ mod platform {
         /// Memory such as file names referenced in this returned entry becomes invalid
         /// with subsequent calls to `next`, as well as when this `Dir` is deinitialized.
         pub(crate) fn next(&mut self) -> Result {
-            self.next_darwin()
+            self.next_darwin(true)
         }
 
-        fn next_darwin(&mut self) -> Result {
+        /// `next` without the OS: `Ok(None)` once the records already read are used up.
+        pub(crate) fn next_buffered(&mut self) -> Result {
+            self.next_darwin(false)
+        }
+
+        fn next_darwin(&mut self, refill: bool) -> Result {
             'start_over: loop {
                 if self.index >= self.end_index {
-                    if self.received_eof {
+                    if self.received_eof || !refill {
                         return Ok(None);
                     }
 
@@ -235,8 +240,20 @@ mod platform {
 
     impl<const USE_WINDOWS_OSPATH: bool> NewIterator<USE_WINDOWS_OSPATH> {
         pub(crate) fn next(&mut self) -> Result {
+            self.step(true)
+        }
+
+        /// `next` without the OS: `Ok(None)` once the records already read are used up.
+        pub(crate) fn next_buffered(&mut self) -> Result {
+            self.step(false)
+        }
+
+        fn step(&mut self, refill: bool) -> Result {
             'start_over: loop {
                 if self.index >= self.end_index {
+                    if !refill {
+                        return Ok(None);
+                    }
                     // SAFETY: dir is a valid open fd; buf is dirent-aligned scratch.
                     let rc = unsafe {
                         getdents(
@@ -330,8 +347,20 @@ mod platform {
         /// Memory such as file names referenced in this returned entry becomes invalid
         /// with subsequent calls to `next`, as well as when this `Dir` is deinitialized.
         pub(crate) fn next(&mut self) -> Result {
+            self.step(true)
+        }
+
+        /// `next` without the OS: `Ok(None)` once the records already read are used up.
+        pub(crate) fn next_buffered(&mut self) -> Result {
+            self.step(false)
+        }
+
+        fn step(&mut self, refill: bool) -> Result {
             'start_over: loop {
                 if self.index >= self.end_index {
+                    if !refill {
+                        return Ok(None);
+                    }
                     // glibc doesn't expose getdents64; go straight to the
                     // raw syscall.
                     // SAFETY: buf is valid for 8192 bytes; fd is a plain c_int.
@@ -536,8 +565,25 @@ mod platform {
         pub(crate) fn next(
             &mut self,
         ) -> sys::Result<Option<<Select<USE_WINDOWS_OSPATH> as WindowsOsPath>::Entry>> {
+            self.step(true)
+        }
+
+        /// `next` without the OS: `Ok(None)` once the records already read are used up.
+        pub(crate) fn next_buffered(
+            &mut self,
+        ) -> sys::Result<Option<<Select<USE_WINDOWS_OSPATH> as WindowsOsPath>::Entry>> {
+            self.step(false)
+        }
+
+        fn step(
+            &mut self,
+            refill: bool,
+        ) -> sys::Result<Option<<Select<USE_WINDOWS_OSPATH> as WindowsOsPath>::Entry>> {
             loop {
                 if self.index >= self.end_index {
+                    if !refill {
+                        return Ok(None);
+                    }
                     // The I/O manager only fills the IO_STATUS_BLOCK on IRP
                     // completion. When NtQueryDirectoryFile fails with an
                     // NT_ERROR status (e.g. parameter validation), the block
@@ -737,6 +783,12 @@ impl NewWrappedIterator<false> {
     pub(crate) fn next(&mut self) -> Result {
         self.iter.next()
     }
+
+    /// `next` without the OS: `Ok(None)` once the records already read are used up.
+    #[inline]
+    pub(crate) fn next_buffered(&mut self) -> Result {
+        self.iter.next_buffered()
+    }
 }
 
 impl NewWrappedIterator<true> {
@@ -744,6 +796,28 @@ impl NewWrappedIterator<true> {
     #[inline]
     pub(crate) fn next(&mut self) -> ResultW {
         self.iter.next()
+    }
+
+    /// `next` without the OS: `Ok(None)` once the records already read are used up.
+    #[cfg(windows)]
+    #[inline]
+    pub(crate) fn next_buffered(&mut self) -> ResultW {
+        self.iter.next_buffered()
+    }
+}
+
+#[cfg(not(windows))]
+impl NewWrappedIterator<false> {
+    /// The read position. [`rewind`](Self::rewind) to it gives back the record that the following `next` returned.
+    #[inline]
+    pub(crate) fn position(&self) -> usize {
+        self.iter.index
+    }
+
+    /// Undoes the one `next` since [`position`](Self::position) returned `position`.
+    #[inline]
+    pub(crate) fn rewind(&mut self, position: usize) {
+        self.iter.index = position;
     }
 }
 
