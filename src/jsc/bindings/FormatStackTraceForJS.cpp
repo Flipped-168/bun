@@ -467,7 +467,8 @@ static String computeErrorInfoWithoutPrepareStackTrace(
     RELEASE_AND_RETURN(scope, Bun::formatStackTrace(vm, globalObject, lexicalGlobalObject, name, message, line, column, sourceURL, stackTrace, errorInstance));
 }
 
-static JSValue computeErrorInfoWithPrepareStackTrace(JSC::VM& vm, Zig::GlobalObject* globalObject, JSC::JSGlobalObject* lexicalGlobalObject, Vector<StackFrame>& stackFrames, OrdinalNumber& line, OrdinalNumber& column, String& sourceURL, JSObject* errorObject, JSObject* prepareStackTrace)
+// One CallSite for each frame. The frames of a Bun realm get their source-mapped positions.
+static JSArray* createCallSites(JSC::VM& vm, Zig::GlobalObject* globalObject, JSC::JSGlobalObject* lexicalGlobalObject, Vector<StackFrame>& stackFrames)
 {
     auto scope = DECLARE_THROW_SCOPE(vm);
 
@@ -549,10 +550,17 @@ static JSValue computeErrorInfoWithPrepareStackTrace(JSC::VM& vm, Zig::GlobalObj
         }
     }
 
-    JSArray* callSitesArray = JSC::constructArray(globalObject, globalObject->arrayStructureForIndexingTypeDuringAllocation(JSC::ArrayWithContiguous), callSites);
+    RELEASE_AND_RETURN(scope, JSC::constructArray(globalObject, globalObject->arrayStructureForIndexingTypeDuringAllocation(JSC::ArrayWithContiguous), callSites));
+}
+
+static JSValue computeErrorInfoWithPrepareStackTrace(JSC::VM& vm, Zig::GlobalObject* globalObject, JSC::JSGlobalObject* lexicalGlobalObject, Vector<StackFrame>& stackFrames, OrdinalNumber& line, OrdinalNumber& column, String& sourceURL, JSObject* errorObject, JSObject* prepareStackTrace)
+{
+    auto scope = DECLARE_THROW_SCOPE(vm);
+
+    JSArray* callSites = createCallSites(vm, globalObject, lexicalGlobalObject, stackFrames);
     RETURN_IF_EXCEPTION(scope, {});
 
-    RELEASE_AND_RETURN(scope, formatStackTraceToJSValue(vm, globalObject, lexicalGlobalObject, errorObject, callSitesArray, prepareStackTrace));
+    RELEASE_AND_RETURN(scope, formatStackTraceToJSValue(vm, globalObject, lexicalGlobalObject, errorObject, callSites, prepareStackTrace));
 }
 
 // Finds Error.prepareStackTrace by name on the realm's Error constructor. Returns an empty value
@@ -778,6 +786,33 @@ JSC_DEFINE_HOST_FUNCTION(errorConstructorFuncAppendStackTrace, (JSC::JSGlobalObj
     }
 
     return JSC::JSValue::encode(jsUndefined());
+}
+
+// captureCallSites(caller, limit), for built-in modules: the CallSites of the frames above `caller`.
+// It goes through neither Error.prepareStackTrace nor Error.stackTraceLimit, so the program's
+// formatter is not called and a changed property cannot break the built-in.
+JSC_DEFINE_HOST_FUNCTION(jsFunctionCaptureCallSites, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))
+{
+    auto& vm = JSC::getVM(lexicalGlobalObject);
+    auto scope = DECLARE_THROW_SCOPE(vm);
+    auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
+
+    uint32_t limit = callFrame->argument(1).toUInt32(lexicalGlobalObject);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    WTF::Vector<JSC::StackFrame> stackTrace;
+    JSCStackTrace::getFramesForCaller(vm, callFrame, callFrame->jsCallee(), callFrame->argument(0), stackTrace, limit);
+    RETURN_IF_EXCEPTION(scope, {});
+
+    // Nothing else keeps the frames' cells alive while the CallSites are allocated.
+    JSC::MarkedArgumentBuffer protectedFrameCells;
+    protectFrameCells(protectedFrameCells, stackTrace);
+    if (protectedFrameCells.hasOverflowed()) [[unlikely]] {
+        throwOutOfMemoryError(lexicalGlobalObject, scope);
+        return {};
+    }
+
+    RELEASE_AND_RETURN(scope, JSValue::encode(createCallSites(vm, globalObject, lexicalGlobalObject, stackTrace)));
 }
 
 JSC_DEFINE_HOST_FUNCTION(jsFunctionDefaultErrorPrepareStackTrace, (JSGlobalObject * lexicalGlobalObject, CallFrame* callFrame))

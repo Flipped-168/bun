@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { bunEnv, bunExe } from "harness";
+import { bunEnv, bunExe, tempDir } from "harness";
 import { join } from "node:path";
 
 const fixture = join(import.meta.dir, "prepare-stack-trace-fixture.js");
@@ -59,14 +59,17 @@ async function run(...cmd: string[]) {
   return { stdout: stdout.trim(), stderr, exitCode, signalCode: proc.signalCode };
 }
 
-async function runFixture(...args: string[]) {
-  const { stdout, stderr, exitCode } = await run(fixture, ...args);
+// The JSON a fixture printed, or what it printed instead.
+async function runForJSON(...cmd: string[]) {
+  const { stdout, stderr, exitCode } = await run(...cmd);
   let result: unknown = { stdout, stderr };
   try {
     result = JSON.parse(stdout);
   } catch {}
   return { result, exitCode };
 }
+
+const runFixture = (...args: string[]) => runForJSON(fixture, ...args);
 
 describe("Error.prepareStackTrace is read from the Error constructor when a stack is formatted", () => {
   const inTheMainRealm = { ...expected, ...expectedWithRememberedLocation, ...expectedWithTheDefaultFormatter };
@@ -134,4 +137,67 @@ test.concurrent.each([
 ])("a getter or a write from another realm cannot break the formatting: %s", async (_, source, expected) => {
   const { stdout, exitCode, signalCode } = await run("-e", source);
   expect({ stdout, exitCode, signalCode }).toEqual({ stdout: expected, exitCode: 0, signalCode: null });
+});
+
+// Node.js captures call sites natively for its own modules, so whatever the program did to
+// Error.prepareStackTrace or Error.stackTraceLimit is neither used nor changed by them.
+test.concurrent("util.getCallSites and url.parse do not read or write the program's hook", async () => {
+  using dir = tempDir("prepare-stack-trace-builtins", {
+    "node_modules/library/index.js": `
+      const util = require("node:util");
+      const url = require("node:url");
+      function sites() {
+        return util.getCallSites(2).map(site => site.functionName);
+      }
+      // From a file in node_modules, url.parse looks at the stack before it warns.
+      function parse() {
+        return url.parse("http://example.com/path").pathname;
+      }
+      module.exports = { sites, parse };
+    `,
+    "main.js": `
+      const library = require("library");
+      const calls = { get: 0, set: 0, formatter: 0 };
+      const describe = () => {
+        const descriptor = Object.getOwnPropertyDescriptor(Error, "prepareStackTrace");
+        return descriptor ? Object.keys(descriptor).sort().join() : "absent";
+      };
+      const results = {};
+      function check(state) {
+        const before = describe();
+        results[state] = [library.sites().join(), library.parse(), describe() === before];
+      }
+      const formatter = () => {
+        calls.formatter++;
+        return "USER";
+      };
+      const get = () => (calls.get++, formatter);
+      const set = () => void calls.set++;
+      Object.defineProperty(Error, "prepareStackTrace", { configurable: true, get, set });
+      check("accessor");
+      Object.defineProperty(Error, "prepareStackTrace", { configurable: true, get, set: undefined });
+      check("getter only");
+      Object.defineProperty(Error, "prepareStackTrace", { configurable: true, writable: false, value: formatter });
+      check("not writable");
+      delete Error.prepareStackTrace;
+      check("deleted");
+      Object.defineProperty(Error, "stackTraceLimit", { configurable: true, get: () => (calls.get++, 0), set });
+      check("stackTraceLimit accessor");
+      console.log(JSON.stringify({ results, calls }));
+    `,
+  });
+  const unchanged = ["sites,check", "/path", true];
+  expect(await runForJSON(join(String(dir), "main.js"))).toEqual({
+    result: {
+      results: {
+        "accessor": unchanged,
+        "getter only": unchanged,
+        "not writable": unchanged,
+        "deleted": unchanged,
+        "stackTraceLimit accessor": unchanged,
+      },
+      calls: { get: 0, set: 0, formatter: 0 },
+    },
+    exitCode: 0,
+  });
 });
