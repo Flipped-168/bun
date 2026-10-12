@@ -82,8 +82,7 @@ pub trait Accessor {
 
     fn open(path: &ZStr) -> Result<Maybe<Self::Handle>, Error>;
     fn openat(handle: Self::Handle, path: &ZStr) -> Result<Maybe<Self::Handle>, Error>;
-    /// `handle` may be `EMPTY` when `path` is absolute: the path is then
-    /// resolved as given.
+    /// `handle` may be `EMPTY` when `path` is absolute.
     fn statat(handle: Self::Handle, path: &ZStr) -> Maybe<Stat>;
     /// Like statat but does not follow symlinks.
     fn lstatat(handle: Self::Handle, path: &ZStr) -> Maybe<Stat>;
@@ -322,11 +321,9 @@ pub enum IterState<A: Accessor> {
 /// The literally named path that `match_literal` resolves.
 #[derive(Clone, Copy)]
 enum Literal {
-    /// The whole pattern, absolute with no glob syntax. A trailing separator needs a
-    /// directory, and a path under a non-directory (ENOTDIR) is no match.
+    /// The whole absolute pattern: a trailing separator needs a directory, ENOTDIR is no match.
     Pattern,
-    /// The last component, in a directory the walk reached. A trailing separator is
-    /// not checked, and ENOTDIR is an error.
+    /// The last component in a reached directory: no separator check, ENOTDIR is an error.
     LastComponent,
 }
 
@@ -546,9 +543,7 @@ impl<'a, A: Accessor, const SENTINEL: bool> Iterator<'a, A, SENTINEL> {
         }
     }
 
-    /// The only place that sets `IterState::Matched`: stat `name` (a byte range of
-    /// the pattern, ending with its last component) from `base`, classify it, and
-    /// record it through `prepare_matched_path`.
+    /// The only place that sets `IterState::Matched`. `name` is a byte range of the pattern.
     fn match_literal(
         &mut self,
         literal: Literal,
@@ -2267,9 +2262,7 @@ pub(crate) fn match_wildcard_literal(literal: &[u8], path: &[u8]) -> bool {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `allocator.dupeZ(u8, s)` — returns owned bytes with trailing NUL included
-/// at index `len()-1`. Kept as `Box<[u8]>` (not `ZBox`) so sentinel and
-/// non-sentinel payloads share the `MatchedPath` shape.
+/// `s` with a trailing NUL at `len() - 1`, as a `Box<[u8]>` so that it can be a `MatchedPath`.
 #[inline]
 fn dupe_z(s: &[u8]) -> Box<[u8]> {
     bun_core::ZBox::from_bytes(s).into_boxed_slice_with_nul()

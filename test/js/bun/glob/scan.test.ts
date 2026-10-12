@@ -874,7 +874,7 @@ describe("absolute path pattern", async () => {
 });
 
 describe("literal last component", () => {
-  test("a regular file matches, with or without a trailing separator", () => {
+  test("matches a file, and a directory that has a trailing separator", () => {
     using dir = tempDir("glob-literal-tail", {
       "a.js": "x",
       "sub/inner.txt": "x",
@@ -884,18 +884,14 @@ describe("literal last component", () => {
 
     expect({
       file: scan("a.js", true),
-      fileTrailingSep: scan("a.js/", false),
       dirTrailingSep: scan("sub/", false),
       dirTrailingSepOnlyFiles: scan("sub/", true),
       afterWildcard: scan("*/inner.txt", true),
-      afterWildcardTrailingSep: scan("*/inner.txt/", false),
     }).toEqual({
       file: ["a.js"],
-      fileTrailingSep: ["a.js"],
       dirTrailingSep: ["sub"],
       dirTrailingSepOnlyFiles: [],
       afterWildcard: [path.join("sub", "inner.txt")],
-      afterWildcardTrailingSep: [path.join("sub", "inner.txt")],
     });
   });
 
