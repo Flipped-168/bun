@@ -786,10 +786,11 @@ JSC_DEFINE_HOST_FUNCTION(jsFunctionDefaultErrorPrepareStackTrace, (JSGlobalObjec
     auto scope = DECLARE_THROW_SCOPE(vm);
     auto* globalObject = defaultGlobalObject(lexicalGlobalObject);
 
-    auto errorObject = dynamicDowncast<JSC::ErrorInstance>(callFrame->argument(0));
+    // Any object, as Error.captureStackTrace takes: a formatter that wraps this one passes on what it was given.
+    auto* errorObject = callFrame->argument(0).getObject();
     auto callSites = dynamicDowncast<JSC::JSArray>(callFrame->argument(1));
     if (!errorObject) {
-        throwTypeError(lexicalGlobalObject, scope, "First argument must be an Error object"_s);
+        throwTypeError(lexicalGlobalObject, scope, "First argument must be an object"_s);
         return {};
     }
     if (!callSites) {

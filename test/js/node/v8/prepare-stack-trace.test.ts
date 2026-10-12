@@ -42,6 +42,17 @@ const expectedWithRememberedLocation = {
     "default x2, C0 x3, default x2, P1, G2 x6, C4 x2, D5 x2, C6 x4, C7, A8 x4, G10 x6, C11 x3, G12 x2, P3 x3, G14 x11, D18, G19 x3, G21 x4",
 };
 
+// These call the default formatter, which the Error of a node:vm context does not have.
+const expectedWithTheDefaultFormatter = {
+  "error-callsites, then depd": ["callsites", "Error", "Inherits: not an Error instance", "default", "callsites"],
+  "the default formatter with an object that is not an Error": [
+    "Error",
+    "Named: with a message",
+    "TypeError",
+    "TypeError",
+  ],
+};
+
 async function run(...cmd: string[]) {
   await using proc = Bun.spawn({ cmd: [bunExe(), ...cmd], env: bunEnv, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
@@ -58,12 +69,10 @@ async function runFixture(...args: string[]) {
 }
 
 describe("Error.prepareStackTrace is read from the Error constructor when a stack is formatted", () => {
-  test.concurrent.each(Object.entries({ ...expected, ...expectedWithRememberedLocation }))(
-    "%s",
-    async (scenario, result) => {
-      expect(await runFixture("main", scenario)).toEqual({ result, exitCode: 0 });
-    },
-  );
+  const inTheMainRealm = { ...expected, ...expectedWithRememberedLocation, ...expectedWithTheDefaultFormatter };
+  test.concurrent.each(Object.entries(inTheMainRealm))("%s", async (scenario, result) => {
+    expect(await runFixture("main", scenario)).toEqual({ result, exitCode: 0 });
+  });
 
   test.concurrent("each write form in a fresh ShadowRealm", async () => {
     expect(await runFixture("ShadowRealm", ...Object.keys(expected))).toEqual({ result: expected, exitCode: 0 });

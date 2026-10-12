@@ -227,6 +227,69 @@ const scenarios = {
     }
     return results.join(", ");
   },
+  // https://github.com/oven-sh/bun/issues/23493: elastic-apm-node loads error-callsites, then express loads depd.
+  "error-callsites, then depd"() {
+    // error-callsites@2.0.4, index.js
+    const callsitesSym = Symbol("callsites");
+    const fallback = Error.prepareStackTrace;
+    let lastPrepareStackTrace = fallback;
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      enumerable: true,
+      get: () => csPrepareStackTrace,
+      set: fn => {
+        lastPrepareStackTrace = fn === csPrepareStackTrace || fn === undefined ? fallback : fn;
+      },
+    });
+    function csPrepareStackTrace(err, callsites) {
+      if (Object.prototype.hasOwnProperty.call(err, callsitesSym)) return fallback(err, callsites);
+      Object.defineProperty(err, callsitesSym, { configurable: true, value: callsites });
+      return lastPrepareStackTrace(err, callsites);
+    }
+    // depd@2.0.0, getStack()
+    function getStack() {
+      const obj = {};
+      const prep = Error.prepareStackTrace;
+      Error.prepareStackTrace = (_, stack) => stack;
+      Error.captureStackTrace(obj);
+      const stack = obj.stack.slice(1);
+      Error.prepareStackTrace = prep;
+      return stack;
+    }
+    const fromDepd = show(getStack());
+    // depd put the accessor's own function back, so the first formatter, the default, is the one that formats now.
+    const plain = {};
+    Error.captureStackTrace(plain);
+    function Inherits(message) {
+      this.message = message;
+      Error.captureStackTrace(this, Inherits);
+    }
+    Object.setPrototypeOf(Inherits.prototype, Error.prototype);
+    Inherits.prototype.name = "Inherits";
+    const error = new Error("boom");
+    return [
+      fromDepd,
+      plain.stack.split("\n")[0],
+      new Inherits("not an Error instance").stack.split("\n")[0],
+      show(error.stack),
+      show(error[callsitesSym]),
+    ];
+  },
+  "the default formatter with an object that is not an Error"() {
+    const thrown = call => {
+      try {
+        return call();
+      } catch (error) {
+        return error.constructor.name;
+      }
+    };
+    return [
+      original({}, []),
+      original({ name: "Named", message: "with a message" }, []),
+      thrown(() => original(1, [])),
+      thrown(() => original(null, [])),
+    ];
+  },
   // Random walks found a build whose remembered Structure the collector could free: this seed
   // made that build call the wrong formatter within 20 steps.
   "a seeded walk of writes, prototype changes and collections"() {
