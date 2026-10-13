@@ -83,7 +83,8 @@ fn has_script(name: &[u8], path: &[u8], contents: &[u8]) -> bool {
     let source = bun_ast::Source::init_path_string(path, contents);
     let (mut log, bump) = (bun_ast::Log::init(), bun_alloc::Arena::new());
     let Ok(json) = bun_parsers::json::parse_package_json_utf8(&source, &mut log, &bump) else {
-        return false;
+        // It may have: `bun run` says what is wrong with the file.
+        return true;
     };
     (json.as_property(b"scripts"))
         .and_then(|scripts| scripts.expr.as_property(name))

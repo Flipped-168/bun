@@ -258,7 +258,7 @@ use bun_threading::Mutex;
 use crate::fs as Fs;
 use crate::fs::FilenameStoreAppender;
 use crate::node_fallbacks as NodeFallbackModules;
-use crate::package_json::{BrowserMap, ESModule, PackageJSON};
+use crate::package_json::{BrowserMap, ESModule, Load, PackageJSON};
 use crate::tsconfig_json::TSConfigJSON;
 
 pub use crate::data_url::DataURL;
@@ -4091,7 +4091,7 @@ impl<'a> Resolver<'a> {
         file: &[u8],
         dirname_fd: FD,
         package_id: Option<Install::PackageID>,
-    ) -> crate::CrateResult<Option<core::ptr::NonNull<PackageJSON>>> {
+    ) -> Load<core::ptr::NonNull<PackageJSON>> {
         use crate::package_json::{IncludeDependencies, IncludeScripts};
         // NOTE: `IncludeDependencies` is a
         // const generic on `PackageJSON::parse`, `IncludeScripts` is runtime (it only
@@ -4118,12 +4118,14 @@ impl<'a> Resolver<'a> {
                 include_scripts,
             )
         };
-        let Some(pkg) = pkg else { return Ok(None) };
-
-        // NOTE: the DirInfo cache holds `&'static` refs. PORTING.md
-        // §Forbidden bars `Box::leak`; intern into the process-lifetime arena
-        // owned alongside the DirInfo singleton instead.
-        Ok(Some(intern_package_json(pkg)))
+        match pkg {
+            // NOTE: the DirInfo cache holds `&'static` refs. PORTING.md
+            // §Forbidden bars `Box::leak`; intern into the process-lifetime arena
+            // owned alongside the DirInfo singleton instead.
+            Load::Loaded(pkg) => Load::Loaded(intern_package_json(pkg)),
+            Load::Absent => Load::Absent,
+            Load::Failed(error) => Load::Failed(error),
+        }
     }
 
     fn dir_info_cached(&mut self, path: &[u8]) -> crate::CrateResult<Option<DirInfoRef>> {
@@ -6342,7 +6344,7 @@ impl<'a> Resolver<'a> {
                 // SAFETY: entries_mutex held; `rfs_ptr` points at the process-global RealFS.
                 if unsafe { entry.kind(rfs_ptr, self.store_fd) } == Fs::file_system::EntryKind::File
                 {
-                    info.package_json = if self.use_package_manager()
+                    let load = if self.use_package_manager()
                         && !info.has_node_modules()
                         && !info.is_node_modules()
                     {
@@ -6355,8 +6357,6 @@ impl<'a> Resolver<'a> {
                             },
                             package_id,
                         )
-                        .ok()
-                        .flatten()
                     } else {
                         self.parse_package_json::<false>(
                             path,
@@ -6367,9 +6367,12 @@ impl<'a> Resolver<'a> {
                             },
                             None,
                         )
-                        .ok()
-                        .flatten()
                     };
+                    match load {
+                        Load::Loaded(pkg) => info.package_json = Some(pkg),
+                        Load::Absent => {}
+                        Load::Failed(error) => info.package_json_load_error = Some(error),
+                    }
 
                     if let Some(pkg) = info.package_json() {
                         if pkg.browser_map.count() > 0 {
