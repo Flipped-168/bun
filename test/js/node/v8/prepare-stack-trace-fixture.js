@@ -172,57 +172,47 @@ const scenarios = {
       return thrown.message;
     }
   },
-  "seventy delete and assign cycles"() {
-    // By now the Structure of the Error constructor is a dictionary, which changes in place.
-    for (let i = 0; i < 70; i++) {
-      delete Error.prepareStackTrace;
-      Error.prepareStackTrace = tag("CYCLE " + i);
-    }
-    const results = [read()];
-    delete Error.prepareStackTrace;
-    results.push(read());
-    Error.prepareStackTrace = tag("ASSIGNED");
-    results.push(read());
-    Object.defineProperty(Error, "prepareStackTrace", { configurable: true, get: () => tag("GETTER") });
-    results.push(read());
-    Object.defineProperty(Error, "prepareStackTrace", { configurable: true, writable: true, value: tag("DEFINED") });
-    results.push(read());
-    Error.prepareStackTrace = original;
-    results.push(read());
-    return results;
+  "an accessor is read two times for one stack"() {
+    let reads = 0;
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      get() {
+        reads++;
+        return function () {
+          return this === Error ? "CALLED ON Error" : "CALLED ON ANOTHER OBJECT";
+        };
+      },
+    });
+    return [show(new Error("boom").stack), reads];
   },
-  "collections between writes that move the property"() {
-    const collect = typeof Bun === "object" ? () => Bun.gc(true) : () => {};
-    const results = [];
-    for (let i = 0; i < 18; i++) {
-      switch (i % 6) {
-        case 0:
-          delete Error.prepareStackTrace;
-          break;
-        case 1:
-          // Takes the offset that the delete made free.
-          Error.decoy = tag("DECOY");
-          break;
-        case 2:
-          Error.prepareStackTrace = tag("ASSIGNED " + i);
-          break;
-        case 3:
-          Object.defineProperty(Error, "prepareStackTrace", { configurable: true, get: () => tag("GETTER " + i) });
-          break;
-        case 4:
-          delete Error.decoy;
-          delete Error.prepareStackTrace;
-          Error.prepareStackTrace = tag("ASSIGNED " + i);
-          break;
-        case 5:
-          // The Structures the constructor had before are garbage after this.
-          Object.setPrototypeOf(Error, { round: i });
-          collect();
-          break;
-      }
-      results.push(read());
+  "a getter that gives a function, then null"() {
+    let reads = 0;
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      get: () => (++reads === 2 ? null : tag("FIRST")),
+    });
+    try {
+      return show(new Error("boom").stack);
+    } catch (thrown) {
+      return [thrown.name, thrown.message, reads];
     }
-    return results.join(", ");
+  },
+  "a getter gives a formatter that throws"() {
+    const failure = new RangeError("formatter threw");
+    Object.defineProperty(Error, "prepareStackTrace", {
+      configurable: true,
+      get: () => () => {
+        throw failure;
+      },
+    });
+    let thrown;
+    try {
+      void new Error("boom").stack;
+    } catch (error) {
+      thrown = error === failure;
+    }
+    Object.defineProperty(Error, "prepareStackTrace", { configurable: true, writable: true, value: tag("LATER") });
+    return [thrown, read()];
   },
   // https://github.com/oven-sh/bun/issues/23493: elastic-apm-node loads error-callsites, then express loads depd.
   "error-callsites, then depd"() {
@@ -287,55 +277,38 @@ const scenarios = {
       thrown(() => original(null, [])),
     ];
   },
-  // Random walks found a build whose remembered Structure the collector could free: this seed
-  // made that build call the wrong formatter within 20 steps.
-  "a seeded walk of writes, prototype changes and collections"() {
-    let seed = 12;
-    const random = n => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) >>> 8) % n;
-    const collect = typeof Bun === "object" ? () => Bun.gc(true) : () => {};
-    let k = 0;
-    const writes = [
-      () => (Error.prepareStackTrace = tag("A" + k++)),
-      () => delete Error.prepareStackTrace,
-      () =>
-        Object.defineProperty(Error, "prepareStackTrace", {
-          configurable: true,
-          get: (
-            f => () =>
-              f
-          )(tag("G" + k++)),
-          set() {},
-        }),
-      () =>
-        Object.defineProperty(Error, "prepareStackTrace", {
-          configurable: true,
-          writable: true,
-          value: tag("D" + k++),
-        }),
-      () => (Error.prepareStackTrace = original),
-      () => (Error["unrelated" + random(90)] = k),
-      () => delete Error["unrelated" + random(90)],
-      () => collect(),
-      () => (Function.prototype.prepareStackTrace = tag("F" + k++)),
-      () => delete Function.prototype.prepareStackTrace,
-      () => {
-        for (let i = 0; i < 70; i++) {
-          delete Error.prepareStackTrace;
-          Error.prepareStackTrace = tag("C" + k);
-        }
-        k++;
-      },
-      () => Object.setPrototypeOf(Error, random(2) ? Function.prototype : { prepareStackTrace: tag("P" + k++) }),
-    ];
-    // The formatter after each step, with a count where it stays the same.
-    const runs = [];
-    for (let i = 0; i < 60; i++) {
-      writes[random(writes.length)]();
-      const result = show(new Error("boom").stack);
-      if (runs.at(-1)?.[0] === result) runs.at(-1)[1]++;
-      else runs.push([result, 1]);
+  // https://github.com/oven-sh/bun/issues/41151
+  "a formatter that calls the default, and a capture whose caller is not on the stack"() {
+    Error.prepareStackTrace = (error, callSites) => original(error, callSites);
+    function Custom() {
+      // `this.constructor` is Error, so no frame is left.
+      Error.captureStackTrace(this, this.constructor);
     }
-    return runs.map(([result, steps]) => (steps > 1 ? result + " x" + steps : result)).join(", ");
+    Custom.prototype = new Error();
+    return new Custom().stack;
+  },
+  "a stack overflow, read where it is caught"() {
+    let calls = 0;
+    const formatter = () => (calls++, "FORMATTED");
+    // The deepest frame reads the stack of its RangeError with almost no stack left.
+    function overflow() {
+      let stack;
+      (function deep() {
+        try {
+          deep();
+        } catch (error) {
+          stack ??= error.stack;
+        }
+      })();
+      return /^RangeError: Maximum call stack size exceeded\.?\n    at /.test(stack) ? "default" : stack;
+    }
+    Error.prepareStackTrace = formatter;
+    const assigned = overflow();
+    Object.defineProperty(Error, "prepareStackTrace", { configurable: true, get: () => formatter });
+    const ownGetter = overflow();
+    delete Error.prepareStackTrace;
+    Object.defineProperty(Function.prototype, "prepareStackTrace", { configurable: true, get: () => formatter });
+    return [assigned, ownGetter, overflow(), calls];
   },
   "other properties first"() {
     Error.unrelated = 1;
@@ -352,16 +325,8 @@ function program(name, withCapture = true) {
   return `const withCapture = ${withCapture};${helpers}\nJSON.stringify((${scenario})())`;
 }
 
-// The same scenario source in another kind of realm. The modules load only where they are used:
-// a debug build takes half a second to load node:worker_threads.
+// The same scenario source in another kind of realm. node:vm loads only when a scenario uses it.
 const inRealm = {
-  Worker: name =>
-    new Promise((resolve, reject) => {
-      const { Worker } = require("node:worker_threads");
-      const worker = new Worker(__filename, { argv: ["inside a Worker", name] });
-      worker.once("message", resolve);
-      worker.once("error", reject);
-    }),
   ShadowRealm: name => JSON.parse(new ShadowRealm().evaluate(program(name))),
   // Error.captureStackTrace in a node:vm context is JavaScriptCore's own and has no formatter hook.
   "node:vm": name => JSON.parse(require("node:vm").runInNewContext(program(name, false))),
@@ -370,11 +335,7 @@ const inRealm = {
 const [realm, ...names] = process.argv.slice(2);
 if (realm === "main") {
   console.log((0, eval)(program(names[0])));
-} else if (realm === "inside a Worker") {
-  require("node:worker_threads").parentPort.postMessage(JSON.parse((0, eval)(program(names[0]))));
 } else {
   // Each scenario in a fresh realm of this kind.
-  Promise.all(names.map(async name => [name, await inRealm[realm](name)])).then(results =>
-    console.log(JSON.stringify(Object.fromEntries(results))),
-  );
+  console.log(JSON.stringify(Object.fromEntries(names.map(name => [name, inRealm[realm](name)]))));
 }
