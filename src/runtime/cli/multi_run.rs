@@ -807,7 +807,7 @@ fn add_script_configs<V: core::ops::Deref<Target = [u8]>>(
     } else {
         // Not a package.json script - run as a raw command
         // If it looks like a file path, prefix with bun executable
-        let command_z: Box<[u8]> = if is_file_path(raw_name) {
+        let command_z: Box<[u8]> = if runs_as_file(raw_name) {
             let bun_path: &[u8] = bun::self_exe_path().map(|z| z.as_bytes()).unwrap_or(b"bun");
             // Quote the bun path so that backslashes on Windows are not
             // interpreted as escape characters by `bun exec` (Bun's shell).
@@ -1072,7 +1072,7 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
         for raw_name in &script_names {
             // Which scripts there are is not known. What is not a file can be one.
             if let ScriptPackage::Unloadable { dir, error } = script_package {
-                if strings::contains_char(raw_name, b'*') || !is_file_path(raw_name) {
+                if strings::contains_char(raw_name, b'*') || !runs_as_file(raw_name) {
                     RunCommand::exit_with_unloadable_package_json(ctx, dir, error);
                 }
             }
@@ -1277,7 +1277,7 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
 }
 
 /// Whether `name` is run as a file, by `bun`, and not as a command of the shell.
-fn is_file_path(name: &[u8]) -> bool {
+fn runs_as_file(name: &[u8]) -> bool {
     !name.is_empty()
         && (name[0] == b'.'
             || name[0] == b'/'
