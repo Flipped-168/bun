@@ -1,9 +1,6 @@
 // Scenarios for Error.prepareStackTrace as a property of the Error constructor. Each one runs in a
 // realm of its own, so its first statement is the first code there that touches the property.
 // The file also runs under Node.js: `node prepare-stack-trace-fixture.js <realm> <scenario>`.
-const { Worker, isMainThread, parentPort, workerData } = require("node:worker_threads");
-const vm = require("node:vm");
-
 // Source text, so that a ShadowRealm or a node:vm context can evaluate the same helpers.
 const helpers = `
   const original = Error.prepareStackTrace;
@@ -355,29 +352,29 @@ function program(name, withCapture = true) {
   return `const withCapture = ${withCapture};${helpers}\nJSON.stringify((${scenario})())`;
 }
 
-// The same scenario source in another kind of realm.
+// The same scenario source in another kind of realm. The modules load only where they are used:
+// a debug build takes half a second to load node:worker_threads.
 const inRealm = {
   Worker: name =>
     new Promise((resolve, reject) => {
-      const worker = new Worker(__filename, { workerData: name });
+      const { Worker } = require("node:worker_threads");
+      const worker = new Worker(__filename, { argv: ["inside a Worker", name] });
       worker.once("message", resolve);
       worker.once("error", reject);
     }),
   ShadowRealm: name => JSON.parse(new ShadowRealm().evaluate(program(name))),
   // Error.captureStackTrace in a node:vm context is JavaScriptCore's own and has no formatter hook.
-  "node:vm": name => JSON.parse(vm.runInNewContext(program(name, false))),
+  "node:vm": name => JSON.parse(require("node:vm").runInNewContext(program(name, false))),
 };
 
-if (!isMainThread) {
-  parentPort.postMessage(JSON.parse((0, eval)(program(workerData))));
+const [realm, ...names] = process.argv.slice(2);
+if (realm === "main") {
+  console.log((0, eval)(program(names[0])));
+} else if (realm === "inside a Worker") {
+  require("node:worker_threads").parentPort.postMessage(JSON.parse((0, eval)(program(names[0]))));
 } else {
-  const [realm, ...names] = process.argv.slice(2);
-  if (realm === "main") {
-    console.log((0, eval)(program(names[0])));
-  } else {
-    // Each scenario in a fresh realm of this kind.
-    Promise.all(names.map(async name => [name, await inRealm[realm](name)])).then(results =>
-      console.log(JSON.stringify(Object.fromEntries(results))),
-    );
-  }
+  // Each scenario in a fresh realm of this kind.
+  Promise.all(names.map(async name => [name, await inRealm[realm](name)])).then(results =>
+    console.log(JSON.stringify(Object.fromEntries(results))),
+  );
 }

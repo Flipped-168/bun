@@ -5,6 +5,7 @@ import { join } from "node:path";
 const fixture = join(import.meta.dir, "prepare-stack-trace-fixture.js");
 
 // What Node.js v26.3.0 prints for each scenario of the fixture. "default" is the engine's own format.
+// These are the ways to write the property, each one the first touch in a new realm.
 const expected = {
   "assign": "ONE",
   "delete after assign": ["ONE", ["undefined", "default"], "TWO"],
@@ -72,38 +73,47 @@ async function runForJSON(...cmd: string[]) {
 const runFixture = (...args: string[]) => runForJSON(fixture, ...args);
 
 describe("Error.prepareStackTrace is read from the Error constructor when a stack is formatted", () => {
-  const inTheMainRealm = { ...expected, ...expectedWithRememberedLocation, ...expectedWithTheDefaultFormatter };
+  // One process for each. The write forms not listed here run in a ShadowRealm below,
+  // which has the same kind of global object as the main realm.
+  const inTheMainRealm = {
+    "delete after assign": expected["delete after assign"],
+    "accessor": expected["accessor"],
+    ...expectedWithTheDefaultFormatter,
+  };
   test.concurrent.each(Object.entries(inTheMainRealm))("%s", async (scenario, result) => {
     expect(await runFixture("main", scenario)).toEqual({ result, exitCode: 0 });
   });
 
-  test.concurrent("each write form in a fresh ShadowRealm", async () => {
+  // The rest run alone: full collections, many realms and a Worker take seconds in a debug
+  // build, and more when other processes compete for the cores.
+  test.each(Object.entries(expectedWithRememberedLocation))("%s", async (scenario, result) => {
+    expect(await runFixture("main", scenario)).toEqual({ result, exitCode: 0 });
+  });
+
+  test("each write form in a fresh ShadowRealm", async () => {
     expect(await runFixture("ShadowRealm", ...Object.keys(expected))).toEqual({ result: expected, exitCode: 0 });
   });
 
-  test.concurrent("each write form in a fresh node:vm context", async () => {
-    expect(await runFixture("node:vm", ...Object.keys(expected))).toEqual({
-      result: {
-        ...expected,
-        // The Error of a node:vm context starts without the property, so these two find nothing to change.
-        "define enumerable only": [[true, true, "default"], "default"],
-        "Object.seal, then assign": ["default", "default"],
-      },
+  test("in a fresh node:vm context", async () => {
+    // The Error of a node:vm context starts without the property.
+    const scenarios = [
+      ...["assign", "delete after assign", "delete first", "accessor", "define value", "not callable"],
+      ...["inherited from Function.prototype", "a formatter that deletes itself"],
+      ...["a getter that reads another stack", "a getter that throws"],
+    ];
+    expect(await runFixture("node:vm", ...scenarios)).toEqual({
+      result: Object.fromEntries(scenarios.map(scenario => [scenario, expected[scenario]])),
       exitCode: 0,
     });
   });
 
-  // A Worker takes seconds to start in a debug build.
-  test.concurrent(
-    "in a Worker",
-    async () => {
-      expect(await runFixture("Worker", "delete after assign", "accessor")).toEqual({
-        result: { "delete after assign": expected["delete after assign"], "accessor": expected["accessor"] },
-        exitCode: 0,
-      });
-    },
-    30_000,
-  );
+  test("in a Worker", async () => {
+    const scenarios = ["delete after assign", "accessor"];
+    expect(await runFixture("Worker", ...scenarios)).toEqual({
+      result: Object.fromEntries(scenarios.map(scenario => [scenario, expected[scenario]])),
+      exitCode: 0,
+    });
+  }, 30_000);
 });
 
 // An error holds the functions in its trace weakly, and these are garbage by the first read of `.stack`.
