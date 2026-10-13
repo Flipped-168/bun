@@ -126,6 +126,7 @@ const SQL = function SQL(
       }
     } catch (err) {
       query.reject(err as Error);
+      if (pool.noteFailedStatement) pool.noteFailedStatement(connectionHandle);
     }
   }
   function queryFromPoolHandler(query, handle, err) {
@@ -208,9 +209,38 @@ const SQL = function SQL(
     }
   }
 
+  // SQLite ends a transaction by itself inside a failing statement. Its adapter records which begin() the connection runs.
+  function lostTransaction(transactionQueries) {
+    return pool.noteFailedStatement !== undefined && pool.transaction !== transactionQueries;
+  }
+
+  // A statement of a begin() that lost its transaction would run in autocommit, or inside the next begin().
+  function queryFromOwnedTransactionHandler(transactionQueries, query, handle, err) {
+    if (pool.transaction !== transactionQueries && !err && !query.cancelled) {
+      transactionQueries.delete(query);
+      return query.reject(
+        pool.invalidTransactionStateError("cannot run a query: the transaction of this sql.begin() is no longer active"),
+      );
+    }
+    if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
+      pool.noteFailedStatement!(this);
+      return true;
+    }
+  }
+
+  const transactionHandler = pool.noteFailedStatement ? queryFromOwnedTransactionHandler : queryFromTransactionHandler;
+
+  function beginFromTransactionHandler(transactionQueries, query, handle, err) {
+    if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
+      pool.noteFailedStatement!(this);
+    } else if (!err && !query.cancelled) {
+      pool.transaction = transactionQueries;
+    }
+  }
+
   // Rolls back in the call where COMMIT failed: the runner resumes after other statements of the connection ran.
   function commitFromTransactionHandler(transactionQueries, query, handle, err) {
-    if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
+    if (transactionHandler.$call(this, transactionQueries, query, handle, err) && !lostTransaction(transactionQueries)) {
       pool.rollbackFailedCommit!(this);
     }
   }
@@ -228,7 +258,7 @@ const SQL = function SQL(
         connectionInfo.bigint
           ? SQLQueryFlags.allowUnsafeTransaction | SQLQueryFlags.bigint
           : SQLQueryFlags.allowUnsafeTransaction,
-        queryFromTransactionHandler.bind(pooledConnection, transactionQueries),
+        transactionHandler.bind(pooledConnection, transactionQueries),
         pool,
       );
 
@@ -244,7 +274,7 @@ const SQL = function SQL(
     values: any[],
     pooledConnection: PooledConnection,
     transactionQueries: Set<Query<any, any>>,
-    handler = queryFromTransactionHandler.bind(pooledConnection, transactionQueries),
+    handler = transactionHandler.bind(pooledConnection, transactionQueries),
   ) {
     try {
       let flags = connectionInfo.bigint
@@ -787,7 +817,11 @@ const SQL = function SQL(
           throw $ERR_INVALID_ARG_VALUE("options.timeout", timeout, "must be a non-negative integer less than 2^31");
         }
 
-        if (timeout > 0 && (transactionQueries.size > 0 || transactionSavepoints.size > 0)) {
+        if (
+          timeout > 0 &&
+          !lostTransaction(transactionQueries) &&
+          (transactionQueries.size > 0 || transactionSavepoints.size > 0)
+        ) {
           const { promise, resolve } = Promise.withResolvers();
           // race all queries vs timeout
           const pending_queries = Array.from(transactionQueries);
@@ -796,10 +830,12 @@ const SQL = function SQL(
             for (const query of transactionQueries) {
               (query as Query<any, any>).cancel();
             }
-            if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
-              await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
+            if (!lostTransaction(transactionQueries)) {
+              if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
+                await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
+              }
+              await run_internal_transaction_sql(ROLLBACK_COMMAND);
             }
-            await run_internal_transaction_sql(ROLLBACK_COMMAND);
             state.connectionState |= ReservedConnectionState.closed;
             resolve();
           }, timeout * 1000);
@@ -814,10 +850,12 @@ const SQL = function SQL(
       for (const query of transactionQueries) {
         (query as Query<any, any>).cancel();
       }
-      if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
-        await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
+      if (!lostTransaction(transactionQueries)) {
+        if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
+          await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
+        }
+        await run_internal_transaction_sql(ROLLBACK_COMMAND);
       }
-      await run_internal_transaction_sql(ROLLBACK_COMMAND);
       state.connectionState |= ReservedConnectionState.closed;
     };
     transaction_sql[Symbol.asyncDispose] = () => transaction_sql.close();
@@ -843,7 +881,7 @@ const SQL = function SQL(
         }
         return result;
       } catch (err) {
-        if (!(state.connectionState & ReservedConnectionState.closed)) {
+        if (!(state.connectionState & ReservedConnectionState.closed) && !lostTransaction(state.queries)) {
           await run_internal_transaction_sql(`${ROLLBACK_TO_SAVEPOINT_COMMAND} ${save_point_name}`);
         }
         throw err;
@@ -882,7 +920,10 @@ const SQL = function SQL(
     }
     let needs_rollback = false;
     try {
-      await run_internal_transaction_sql(BEGIN_COMMAND);
+      await run_internal_transaction_sql(
+        BEGIN_COMMAND,
+        pool.noteFailedStatement && beginFromTransactionHandler.bind(pooledConnection, state.queries),
+      );
       needs_rollback = true;
       let transaction_result = await callback(transaction_sql);
       if ($isArray(transaction_result)) {
@@ -910,7 +951,7 @@ const SQL = function SQL(
       return resolve(transaction_result);
     } catch (err) {
       try {
-        if (!(state.connectionState & ReservedConnectionState.closed) && needs_rollback) {
+        if (!(state.connectionState & ReservedConnectionState.closed) && needs_rollback && !lostTransaction(state.queries)) {
           if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
             await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
           }
