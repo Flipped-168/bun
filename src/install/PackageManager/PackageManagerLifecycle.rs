@@ -4,9 +4,9 @@ use std::io::Write as _;
 
 use bstr::BStr;
 
-use bun_collections::ArrayHashMap;
+use bun_collections::{ArrayHashMap, index_sort};
 use bun_core::fmt::PathSep;
-use bun_core::{Output, ZBox, fmt as bun_fmt, handle_oom};
+use bun_core::{Global, Output, ZBox, fmt as bun_fmt, handle_oom};
 use bun_core::{ZStr, strings};
 use bun_paths::resolve_path::{join_abs_string_z, platform};
 use bun_paths::{AutoAbsPath, EnvPath};
@@ -16,6 +16,7 @@ use bun_sys as Syscall;
 use crate::bun_fs::FileSystem;
 
 use super::directories;
+use super::{Subcommand, UpdateRequest};
 use crate::lifecycle_script_runner::{
     InstallCtx, LifecycleScriptSubprocess as RealLifecycleScriptSubprocess,
 };
@@ -466,6 +467,128 @@ impl PackageManager {
 
         set
     }
+
+    /// Runs between resolution and `clean_with_logger`. A tarball, folder or git package is trusted by the name of its root or workspace row, which a person is expected to have written. A row in `named_by_resolution` took that name from its package, so the package would pick its own trust: refused, unless `--trust` covers the request or a row that a person named already declares the same package.
+    #[inline]
+    pub(crate) fn refuse_trust_by_own_name(&mut self) {
+        if self.named_by_resolution.is_empty() {
+            return;
+        }
+        self.refuse_trust_by_own_name_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refuse_trust_by_own_name_slow(&mut self) {
+        let mut named = core::mem::take(&mut self.named_by_resolution);
+        index_sort::sort_indices_unstable(&mut named, &mut |a, b| a.cmp(&b));
+        named.dedup();
+
+        let lockfile: &Lockfile = &self.lockfile;
+        let buf = lockfile.buffers.string_bytes.as_slice();
+        let rows = lockfile.buffers.dependencies.as_slice();
+        let resolved = lockfile.buffers.resolutions.as_slice();
+        let packages = lockfile.packages.slice();
+        let resolutions = packages.items_resolution();
+        let trust_from_args = self.options.do_.trust_dependencies_from_args();
+        let mut refused = false;
+
+        for &row in &named {
+            let Some(dep) = rows.get(row as usize) else {
+                continue;
+            };
+            let Some(resolution) = resolutions.get(resolved[row as usize] as usize) else {
+                continue;
+            };
+            let name = dep.name.slice(buf);
+            // The registry names an npm package, and a workspace runs its scripts without trust.
+            if !matches!(
+                resolution.tag,
+                ResolutionTag::Folder
+                    | ResolutionTag::LocalTarball
+                    | ResolutionTag::RemoteTarball
+                    | ResolutionTag::Git
+                    | ResolutionTag::Github
+                    | ResolutionTag::Symlink
+            ) || lockfile.get_workspace_pkg_if_workspace_dep(row) == invalid_package_id
+                || !lockfile.has_trusted_dependency(name, name, resolution)
+            {
+                continue;
+            }
+            let spec = dep.version.literal.slice(buf);
+            let requested = self.update_requests.iter().any(|request| {
+                !request.is_aliased && request.version.literal.slice(request.version_buf()) == spec
+            });
+            if trust_from_args && requested {
+                continue;
+            }
+            let declared_by_a_person = resolutions
+                .iter()
+                .zip(packages.items_dependencies())
+                .filter(|(owner, _)| {
+                    matches!(owner.tag, ResolutionTag::Root | ResolutionTag::Workspace)
+                })
+                .flat_map(|(_, list)| list.begin()..list.end())
+                .any(|other| {
+                    named.binary_search(&other).is_err()
+                        && rows[other as usize].name.slice(buf) == name
+                        && resolutions
+                            .get(resolved[other as usize] as usize)
+                            .is_some_and(|declared| declared.eql(resolution, buf, buf))
+                });
+            if declared_by_a_person {
+                continue;
+            }
+
+            Output::flush();
+            Output::err_generic(
+                "{} calls itself {}, and {} is in trustedDependencies",
+                (
+                    bun_fmt::quote(spec),
+                    bun_fmt::quote(name),
+                    bun_fmt::quote(name),
+                ),
+            );
+            if !requested {
+                bun_core::note!(
+                    "a package cannot pick a trusted name. To trust it, name it in package.json: {}: {}",
+                    bun_fmt::quote(name),
+                    bun_fmt::quote(spec),
+                );
+            } else if named_request_parses(name, spec) {
+                bun_core::note!(
+                    "a package cannot pick a trusted name. To trust it, pass --trust or name it: bun add {}@{}",
+                    BStr::new(name),
+                    BStr::new(spec),
+                );
+            } else {
+                bun_core::note!("a package cannot pick a trusted name. To trust it, pass --trust");
+            }
+            refused = true;
+        }
+
+        if refused {
+            Global::crash();
+        }
+    }
+}
+
+/// Whether `bun add <name>@<spec>` keeps `name` as the name of the dependency.
+fn named_request_parses(name: &[u8], spec: &[u8]) -> bool {
+    let positional = [name, b"@", spec].concat();
+    let mut log = bun_ast::Log::init();
+    let mut requests = Vec::new();
+    UpdateRequest::parse_with_error(
+        None,
+        &mut log,
+        &[&positional],
+        &mut requests,
+        Subcommand::Add,
+        false,
+    )
+    .is_ok_and(
+        |requests| matches!(requests, [request] if request.is_aliased && request.name == name),
+    )
 }
 
 fn add_package_to_set(

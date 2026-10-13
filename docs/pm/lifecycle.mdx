@@ -65,6 +65,21 @@ Defining `trustedDependencies` in `package.json` **replaces** the default list r
 
 Set `trustedDependencies: []` when you want to opt out of the default allow list entirely without passing `--ignore-scripts` on every install. If you define `trustedDependencies` with an explicit list, include any packages from the [default list](https://github.com/oven-sh/bun/blob/main/src/install/default-trusted-dependencies.txt) whose lifecycle scripts you still need (for example, `sharp` or `esbuild`). Bun no longer trusts those packages implicitly.
 
+### Dependencies added without a name
+
+`bun add` accepts a tarball URL, a local path, or a git URL without a name. Bun then takes the name of the dependency from the `package.json` inside the package. A package must not pick a trusted name for itself, so Bun refuses the add when that name is in `trustedDependencies`.
+
+```bash terminal icon="terminal"
+bun add https://example.com/sharp.tgz
+```
+
+```txt
+error: "https://example.com/sharp.tgz" calls itself "sharp", and "sharp" is in trustedDependencies
+note: a package cannot pick a trusted name. To trust it, pass --trust or name it: bun add sharp@https://example.com/sharp.tgz
+```
+
+To add the package and run its lifecycle scripts, pass `--trust` or write the name yourself. To add it without trust, write a name that is not in `trustedDependencies`, for example `bun add sharp-fork@https://example.com/sharp.tgz`. The same rule applies to a `package.json` entry whose key is empty or equal to its value.
+
 ---
 
 ## `--ignore-scripts`

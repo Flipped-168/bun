@@ -50,4 +50,8 @@ bun install
 
 ---
 
+`bun add` refuses a dependency that has no name of its own (a tarball URL, a local path, or a git URL) when the name in its `package.json` is in `trustedDependencies`. Pass `--trust`, or write the name yourself with `bun add <name>@<spec>`. See [dependencies added without a name](/pm/lifecycle#dependencies-added-without-a-name).
+
+---
+
 See [trusted dependencies](/pm/lifecycle).

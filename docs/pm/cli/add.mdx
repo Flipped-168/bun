@@ -188,6 +188,8 @@ To tell Bun to allow lifecycle scripts for a particular package, add the package
 
 Bun reads this field and runs lifecycle scripts for `my-trusted-package`.
 
+A dependency added without a name (a tarball URL, a local path, or a git URL) takes its name from its own `package.json`. If that name is in `trustedDependencies`, `bun add` refuses the dependency, because the package picked the name. Pass `--trust`, or write the name yourself with `bun add <name>@<spec>`. See [dependencies added without a name](/pm/lifecycle#dependencies-added-without-a-name).
+
 ## Git dependencies
 
 To add a dependency from a public or private git repository:
