@@ -1,6 +1,7 @@
 import { fileURLToPath, pathToFileURL } from "bun";
 import { describe, expect, it } from "bun:test";
 import { isWindows } from "harness";
+import { join } from "node:path";
 
 describe("pathToFileURL", () => {
   it("should convert a path to a file url", () => {
@@ -60,5 +61,30 @@ describe("fileURLToPath", () => {
     const url = pathToFileURL(import.meta.path);
     expect(fileURLToPath(url)).toBe(import.meta.path);
     expect(fileURLToPath(import.meta.url)).toBe(import.meta.path);
+  });
+
+  // "50%deposit.db" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+  it.each(["50%deposit.db", "caf%E9.db", "%80", "%C0%AF", "%ED%A0%80", "%F4%90%80%80"])(
+    "throws a URIError when the path does not percent-decode to UTF-8: %s",
+    name => {
+      const url = new URL(name, pathToFileURL(import.meta.dir + "/"));
+      for (const input of [url, url.href]) {
+        let error;
+        try {
+          fileURLToPath(input);
+        } catch (e) {
+          error = e;
+        }
+        expect(error).toBeInstanceOf(URIError);
+        expect({ message: error.message, code: error.code }).toEqual({ message: "URI malformed", code: undefined });
+      }
+    },
+  );
+
+  it("keeps a % that does not start an escape", () => {
+    const base = pathToFileURL(import.meta.dir + "/");
+    for (const name of ["50%.db", "50%zz.db", "50%2"]) {
+      expect(fileURLToPath(new URL(name, base))).toBe(join(import.meta.dir, name));
+    }
   });
 });

@@ -540,3 +540,42 @@ test.concurrent("mock.module() of a module whose import() is still loading its d
   expect(stderr).toContain(" 1 pass");
   expect(exitCode).toBe(0);
 });
+
+// "50%deposit.ts" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+// The path of the module was a null string, and the map of the mocks hashed it: a crash.
+test("a module whose name has a % that is not a UTF-8 escape can be mocked", async () => {
+  using dir = tempDir("mock-module-percent", {
+    "percent.test.ts": `
+      import { expect, mock, test } from "bun:test";
+
+      test("a relative name that does not resolve", async () => {
+        for (const name of ["./50%deposit.ts", "./100%effort.ts", "./dir/caf%E9.ts"]) {
+          mock.module(name, () => ({ default: "the mock of " + name }));
+          expect((await import(name)).default).toBe("the mock of " + name);
+          expect(require(name).default).toBe("the mock of " + name);
+        }
+      });
+
+      test("a relative name with an escape that is UTF-8 is the name it was before", async () => {
+        mock.module("./a%20b.ts", () => ({ default: "the mock of a%20b" }));
+        expect((await import("./a%20b.ts")).default).toBe("the mock of a%20b");
+      });
+
+      test("a file: URL throws", () => {
+        for (const url of ["file:///50%deposit.ts", "file:./caf%E9.ts"]) {
+          expect(() => mock.module(url, () => ({}))).toThrow(new TypeError('Invalid "file:" URL'));
+        }
+      });
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "test", "./percent.test.ts"],
+    cwd: String(dir),
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect(stderr).toContain(" 3 pass\n 0 fail");
+  expect(exitCode).toBe(0);
+});

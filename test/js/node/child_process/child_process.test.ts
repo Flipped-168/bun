@@ -29,6 +29,7 @@ import { getEventListeners, once, setMaxListeners } from "node:events";
 import net from "node:net";
 import os from "node:os";
 import tls from "node:tls";
+import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import path from "path";
 const debug = process.env.DEBUG ? console.log : () => {};
@@ -1774,4 +1775,31 @@ describe.skipIf(!isPosix)("child.stdout pull nested in a 'data' event", () => {
     // several seconds, and the fixtures give up on their markers after 15 s so
     // their own error, not a test timeout, is what gets reported.
   }, 30_000);
+});
+
+// "50%deposit" is a directory name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+// The child ran in the parent's directory. node throws at the conversion, before it starts a child.
+describe("cwd is a file URL whose path does not percent-decode to UTF-8", () => {
+  const child = path.join(import.meta.dir, "fixtures", "child-process-echo-argv.js");
+  it.each<[string, (cwd: URL) => unknown]>([
+    ["spawn", cwd => spawn(bunExe(), [child], { cwd, env: bunEnv })],
+    ["spawnSync", cwd => spawnSync(bunExe(), [child], { cwd, env: bunEnv })],
+    ["exec", cwd => exec(`"${bunExe()}" "${child}"`, { cwd, env: bunEnv })],
+    ["execSync", cwd => execSync(`"${bunExe()}" "${child}"`, { cwd, env: bunEnv, stdio: "ignore" })],
+    ["execFile", cwd => execFile(bunExe(), [child], { cwd, env: bunEnv })],
+    ["execFileSync", cwd => execFileSync(bunExe(), [child], { cwd, env: bunEnv, stdio: "ignore" })],
+    ["fork", cwd => fork(child, [], { cwd, env: bunEnv, stdio: "ignore" })],
+  ])("%s throws the URIError", (_, call) => {
+    let error: any;
+    try {
+      call(new URL("50%deposit/", pathToFileURL(os.tmpdir() + path.sep)));
+    } catch (e) {
+      error = e;
+    }
+    expect({ name: error?.name, message: error?.message, code: error?.code }).toEqual({
+      name: "URIError",
+      message: "URI malformed",
+      code: undefined,
+    });
+  });
 });

@@ -1182,6 +1182,7 @@ describe.concurrent("what onResolve answers without a namespace", () => {
         "bare.img": "bare",
         "symlink.img": join(import.meta.dir, "src", "link.img"),
         "long.img": "/" + Buffer.alloc(200_000, "a") + ".js",
+        "undecodable.img": "file:///50%deposit.mjs",
       };
       Bun.plugin({
         name: "answers",
@@ -1290,6 +1291,25 @@ describe.concurrent("what onResolve answers without a namespace", () => {
     `;
     expect(await run("entry.cjs", source)).toEqual({
       stdout: "require() ENAMETOOLONG\nimport() ENAMETOOLONG\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // "50%deposit.mjs" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+  // The URL converted to a null path, and the lookup among the build.module() modules hashed it: a crash.
+  it("is an error to catch when it is a file URL whose path does not percent-decode to UTF-8", async () => {
+    const source = `
+      try { require("undecodable.img"); } catch (error) { console.log("require()", error.name, error.message.split("\\n")[0]); }
+      for (const specifier of ["undecodable.img", "file:///50%deposit.mjs"])
+        await import(specifier).catch(error => console.log("import()", error.name, error.message.split(" imported")[0]));
+    `;
+    expect(await run("entry.mjs", source)).toEqual({
+      stdout:
+        "require() ResolveMessage Cannot find module 'file:///50%deposit.mjs'\n" +
+        "import() ResolveMessage Cannot find module 'file:///50%deposit.mjs'\n" +
+        // As node: import() of the URL itself rejects with decodeURIComponent()'s error.
+        "import() URIError URI malformed\n",
       stderr: "",
       exitCode: 0,
     });

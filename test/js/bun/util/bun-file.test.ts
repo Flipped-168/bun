@@ -155,3 +155,19 @@ test("Bun.file().json() with UTF-8 BOM does not free an interior pointer", async
   });
   expect(exitCode).toBe(0);
 });
+
+// "50%deposit.txt" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+test("Bun.file() and Bun.write() throw a URIError for a file URL whose path does not percent-decode to UTF-8", async () => {
+  const url = new URL("50%deposit.txt", Bun.pathToFileURL(import.meta.dir + "/"));
+  const thrown = (fn: () => unknown) => {
+    try {
+      fn();
+    } catch (error: any) {
+      return { name: error.name, message: error.message, code: error.code };
+    }
+  };
+  const expected = { name: "URIError", message: "URI malformed", code: undefined };
+  expect(thrown(() => Bun.file(url))).toEqual(expected);
+  expect(thrown(() => Bun.write(url, "never written"))).toEqual(expected);
+  expect(thrown(() => Bun.write(join(import.meta.dir, "never-written.txt"), Bun.file(url)))).toEqual(expected);
+});

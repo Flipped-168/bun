@@ -278,6 +278,57 @@ it("file url with special characters in require resolves", async () => {
   expect(stdout.toString("utf8")).toBe(`${dir}${sep}${filename}\n`);
 });
 
+// "50%deposit.js" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+// The URL converted to the path "", and the errors were about a module with no name.
+it("file url whose path does not percent-decode to UTF-8 is an error that names it", async () => {
+  using dir = tempDir("fileurl", {
+    "50%deposit.js": "export const foo = 1;",
+    "dynamic.mjs": `
+      const href = new URL("50%deposit.js", import.meta.url).href;
+      const loads = {
+        "import()": () => import(href),
+        "require()": async () => require(href),
+        "require.resolve()": async () => require.resolve(href),
+        "Bun.resolveSync()": async () => Bun.resolveSync(href, import.meta.dir),
+        "Bun.resolve()": () => Bun.resolve(href, import.meta.dir),
+      };
+      for (const [name, load] of Object.entries(loads)) {
+        const error = await load().then(() => undefined, error => error);
+        console.log(name, error?.name, error?.message.split("\\n")[0].split(" imported from ")[0].replaceAll(href, "<href>"));
+      }
+    `,
+  });
+  writeFileSync(`${dir}/static.mjs`, `import { foo } from '${pathToFileURL(String(dir))}/50%deposit.js';\nconsole.log(foo);`);
+
+  const run = async (entry: string) => {
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), entry],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout, stderr, exitCode };
+  };
+
+  expect(await run("dynamic.mjs")).toEqual({
+    stdout:
+      // As node: import() rejects with decodeURIComponent()'s error.
+      "import() URIError URI malformed\n" +
+      "require() ResolveMessage Cannot find module '<href>'\n" +
+      "require.resolve() ResolveMessage Cannot find module '<href>'\n" +
+      "Bun.resolveSync() ResolveMessage Cannot find module '<href>'\n" +
+      "Bun.resolve() ResolveMessage Cannot find module '<href>'\n",
+    stderr: "",
+    exitCode: 0,
+  });
+
+  const fromStatement = await run("static.mjs");
+  expect(fromStatement.stderr).toContain("URIError: URI malformed");
+  expect({ stdout: fromStatement.stdout, exitCode: fromStatement.exitCode }).toEqual({ stdout: "", exitCode: 1 });
+});
+
 it("import long string should not segfault", async () => {
   try {
     await import("a".repeat(10000));

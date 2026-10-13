@@ -1680,6 +1680,13 @@ describe.concurrent(() => {
     );
   });
 
+  // "50%deposit.node" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+  // The URL converted to the path "", and dlopen("") opens the program itself.
+  it("dlopen does not accept a file: URL whose path does not percent-decode to UTF-8", () => {
+    const url = new URL("50%deposit.node", import.meta.url);
+    expect(() => process.dlopen({ exports: {} }, url.href)).toThrow("invalid file: URL passed to dlopen");
+  });
+
   it("process.constrainedMemory()", () => {
     expect(process.constrainedMemory() >= 0).toBe(true);
   });

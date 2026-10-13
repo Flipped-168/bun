@@ -55,8 +55,10 @@ import fs, {
   writeSync,
   writevSync,
 } from "node:fs";
+import assert from "node:assert";
 import * as os from "node:os";
 import path, { dirname, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { inspect, promisify } from "node:util";
 
 import _promises, { type FileHandle } from "node:fs/promises";
@@ -7443,5 +7445,69 @@ describe("module init", () => {
       k => !k.startsWith("File") && typeof fs[k] === "function" && fs[k].name !== k,
     );
     expect(mismatched).toStrictEqual([]);
+  });
+});
+
+// "50%deposit.txt" is a file name. In a URL its "%de" is an escape, and the byte DE is not UTF-8.
+// node throws decodeURIComponent()'s URIError where it converts the URL, and so nothing acts on "".
+describe("a file URL whose path does not percent-decode to UTF-8", () => {
+  const url = () => new URL("50%deposit.txt", pathToFileURL(import.meta.dir + path.sep));
+  const other = join(import.meta.dir, "readFileSync.txt");
+  const isURIMalformed = (err: any) => {
+    assert.strictEqual(err.name, "URIError");
+    assert.strictEqual(err.message, "URI malformed");
+    assert.strictEqual(err.code, undefined);
+    return true;
+  };
+
+  it.each<[string, (url: URL) => unknown]>([
+    ["readFileSync", url => fs.readFileSync(url)],
+    ["writeFileSync", url => fs.writeFileSync(url, "")],
+    ["appendFileSync", url => fs.appendFileSync(url, "")],
+    ["statSync", url => fs.statSync(url)],
+    ["lstatSync", url => fs.lstatSync(url)],
+    ["accessSync", url => fs.accessSync(url)],
+    ["openSync", url => fs.openSync(url, "r")],
+    ["readdirSync", url => fs.readdirSync(url)],
+    ["opendirSync", url => fs.opendirSync(url)],
+    ["mkdirSync", url => fs.mkdirSync(url)],
+    ["rmSync", url => fs.rmSync(url)],
+    ["unlinkSync", url => fs.unlinkSync(url)],
+    ["realpathSync", url => fs.realpathSync(url)],
+    ["renameSync, the old path", url => fs.renameSync(url, other)],
+    ["renameSync, the new path", url => fs.renameSync(other, url)],
+    ["copyFileSync", url => fs.copyFileSync(url, other)],
+    ["cpSync, the source", url => fs.cpSync(url, other)],
+    ["cpSync, the destination", url => fs.cpSync(other, url)],
+    ["globSync, the cwd", url => fs.globSync("*", { cwd: url })],
+    ["createReadStream", url => fs.createReadStream(url)],
+    ["createWriteStream", url => fs.createWriteStream(url)],
+    ["watch", url => fs.watch(url)],
+    ["watchFile", url => fs.watchFile(url, () => {})],
+    ["unwatchFile", url => fs.unwatchFile(url)],
+    ["readFile with a callback", url => fs.readFile(url, () => {})],
+    ["stat with a callback", url => fs.stat(url, () => {})],
+    ["cp with a callback", url => fs.cp(url, other, () => {})],
+    ["glob with a callback", url => fs.glob("*", { cwd: url }, () => {})],
+  ])("fs.%s throws the URIError", (_, call) => {
+    assert.throws(() => call(url()), isURIMalformed);
+  });
+
+  it.each<[string, (url: URL) => Promise<unknown>]>([
+    ["readFile", url => promises.readFile(url)],
+    ["writeFile", url => promises.writeFile(url, "")],
+    ["stat", url => promises.stat(url)],
+    ["open", url => promises.open(url)],
+    ["cp", url => promises.cp(url, other)],
+    ["glob, the cwd", url => Array.fromAsync(promises.glob("*", { cwd: url }))],
+  ])("fs.promises.%s rejects with the URIError", async (_, call) => {
+    await assert.rejects(call(url()), isURIMalformed);
+  });
+
+  it("fs.existsSync and fs.exists say false", async () => {
+    expect(fs.existsSync(url())).toBe(false);
+    const { promise, resolve } = Promise.withResolvers<boolean>();
+    fs.exists(url(), resolve);
+    expect(await promise).toBe(false);
   });
 });
