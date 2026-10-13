@@ -107,6 +107,9 @@ bun_core::comptime_string_map! {
     };
 }
 
+pub mod error;
+pub use error::Error;
+
 pub use draft::{
     NpmrcDiagnostics, Parser, RegistryKey, load_npmrc, load_npmrc_config, npm_config_bool,
 };
@@ -127,7 +130,7 @@ mod draft {
     use bun_url::URL;
 
     use super::{
-        ConfigItem, ConfigOpt, NODE_LINKER_MAP, NodeLinker, inline_comment_start, is_quoted,
+        ConfigItem, ConfigOpt, Error, NODE_LINKER_MAP, NodeLinker, inline_comment_start, is_quoted,
         next_dot, should_skip_line, trim_js_whitespace, trim_js_whitespace_right,
     };
 
@@ -188,9 +191,8 @@ mod draft {
             }
         }
 
-        // deinit -> Drop: `logger` is owned and drops automatically.
-
-        pub fn parse(&mut self, bump: &'a Arena) -> OOM<()> {
+        pub fn parse(&mut self, log: &mut Log, bump: &'a Arena) -> Result<(), Error> {
+            self.source.check_parseable_len(log, "INI document")?;
             let src = self.src;
             let env = self.env;
             let source_path = self.source.path.text;
@@ -250,7 +252,7 @@ mod draft {
                         let mut r = root;
                         let parent_object = match r.get_or_put_object(section, bump) {
                             Ok(v) => v,
-                            Err(E::SetError::OutOfMemory) => return Err(AllocError),
+                            Err(E::SetError::OutOfMemory) => return Err(AllocError.into()),
                             Err(E::SetError::Clobber) => {
                                 // We're in here if key exists but it is not an object
                                 //
@@ -1085,6 +1087,8 @@ mod draft {
         let mut log = Log::init();
         let mut configs: Vec<ConfigItem> = Vec::new();
         let mut sources: Vec<Source> = Vec::new();
+        let warns =
+            diagnostics == NpmrcDiagnostics::Print && log.level.at_least(bun_ast::Level::Warn);
 
         for &npmrc_path in npmrc_paths {
             match bun_ast::source_from_file(
@@ -1093,34 +1097,49 @@ mod draft {
             ) {
                 Ok(source) => sources.push(source),
                 Err(err) => {
-                    if diagnostics == NpmrcDiagnostics::Print
-                        && log.level.at_least(bun_ast::Level::Warn)
-                        && err.is_unreadable_file(npmrc_path.as_bytes())
-                    {
-                        bun_core::warn!(
-                            "{}\nThe registry and auth settings in <b>{}<r> are not applied.",
-                            err,
-                            bstr::BStr::new(npmrc_path.as_bytes()),
-                        );
+                    if warns && err.is_unreadable_file(npmrc_path.as_bytes()) {
+                        warn_not_applied(&err, npmrc_path);
                     }
                     continue;
                 }
             }
 
             let source_idx = sources.len() - 1;
-            bun_core::handle_oom(parse_npmrc_into(
+            match parse_npmrc_into(
                 install,
                 env,
                 &mut log,
                 &sources[source_idx],
                 source_idx as u32,
                 &mut configs,
-            ));
+            ) {
+                Ok(()) => {}
+                Err(Error::Alloc(_)) => bun_core::out_of_memory(),
+                // The parser logged the reason and applied no line of the file.
+                Err(Error::SourceTooLarge) => {
+                    // Frees the file before the next one is read.
+                    sources.pop();
+                    if warns && let Some(reason) = log.msgs.first() {
+                        warn_not_applied(bstr::BStr::new(&reason.data.text), npmrc_path);
+                    }
+                    log.reset();
+                    continue;
+                }
+            }
             report_log(&mut log, diagnostics);
         }
 
         resolve_url_auth(install, bunfig, &configs, &sources, &mut log);
         report_log(&mut log, diagnostics);
+    }
+
+    /// For a `.npmrc` that is there and supplies nothing.
+    fn warn_not_applied(reason: impl fmt::Display, npmrc_path: &ZStr) {
+        bun_core::warn!(
+            "{}\nThe registry and auth settings in <b>{}<r> are not applied.",
+            reason,
+            bstr::BStr::new(npmrc_path.as_bytes()),
+        );
     }
 
     /// Prints and clears `log`, under a header that names the file of its first error.
@@ -1355,7 +1374,7 @@ mod draft {
         env: &DotEnvLoader,
         log: &mut Log,
         source: &Source,
-    ) -> OOM<()> {
+    ) -> Result<(), Error> {
         let mut configs: Vec<ConfigItem> = Vec::new();
         parse_npmrc_into(install, env, log, source, 0, &mut configs)?;
         let sources = std::slice::from_ref(source);
@@ -1371,11 +1390,11 @@ mod draft {
         source: &Source,
         source_idx: u32,
         configs: &mut Vec<ConfigItem>,
-    ) -> OOM<()> {
+    ) -> Result<(), Error> {
         let arena = Arena::new();
         let bump = &arena;
         let mut parser = Parser::init(source, env);
-        parser.parse(bump)?;
+        parser.parse(log, bump)?;
         // Need to be very, very careful here with strings.
         // They are allocated in the Parser's arena, which of course gets
         // deinitialized at the end of the scope.
@@ -1502,7 +1521,7 @@ mod draft {
             if let Some(expr) = out.get(key) {
                 *pattern = match pnpm_matcher_from_expr(&expr, log, source, bump) {
                     Ok(v) => Some(v),
-                    Err(FromExprError::OutOfMemory) => return Err(AllocError),
+                    Err(FromExprError::OutOfMemory) => return Err(AllocError.into()),
                     Err(FromExprError::UnexpectedExpr) => {
                         log.reset();
                         None

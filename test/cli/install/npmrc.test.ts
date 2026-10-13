@@ -1,9 +1,20 @@
 import { write } from "bun";
 import { afterAll, beforeAll, describe, expect, it, test } from "bun:test";
-import { chmodSync, mkdirSync, readdirSync, writeFileSync } from "fs";
+import { chmodSync, closeSync, ftruncateSync, mkdirSync, openSync, readdirSync, writeFileSync, writeSync } from "fs";
 import { rm } from "fs/promises";
-import { bunEnv, bunExe, isIPv6, isLinux, isWindows, tempDir, tls, unprivilegedSpawnOptions } from "harness";
+import {
+  bunEnv,
+  bunExe,
+  isIPv6,
+  isLinux,
+  isWindows,
+  normalizeBunSnapshot,
+  tempDir,
+  tls,
+  unprivilegedSpawnOptions,
+} from "harness";
 import { createServer as createTlsServer } from "node:tls";
+import { totalmem } from "os";
 import { dirname, join } from "path";
 import { TestRegistry } from "registry";
 const { iniInternals } = require("bun:internal-for-testing");
@@ -5331,6 +5342,76 @@ describe.skipIf(isWindows)("unreadable config files", () => {
     const { stderr, exitCode } = await run(["install"], () => {});
     expect(stderr).not.toContain("warn:");
     expect(exitCode).toBe(0);
+  });
+});
+
+// The INI parser records a source position as an i32 byte offset. `bun pm cache` loads `~/.npmrc`, then `./.npmrc`,
+// contacts no registry and prints the cache directory. `~/.npmrc` names that directory here, so the output shows that
+// it applied and that no line of `./.npmrc` replaced it.
+describe.concurrent("source positions in a .npmrc", () => {
+  async function pmCache(dir: string) {
+    const home = join(dir, "home");
+    // It would win over `cache`.
+    const { BUN_INSTALL_CACHE_DIR, ...withoutCacheDir } = env;
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "pm", "cache"],
+      cwd: join(dir, "project"),
+      env: { ...withoutCacheDir, HOME: home, USERPROFILE: home, XDG_CONFIG_HOME: home, NO_COLOR: "1" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return { stdout: normalizeBunSnapshot(stdout, dir), stderr, exitCode, signalCode: proc.signalCode };
+  }
+
+  const files = {
+    "home/.npmrc": "cache=from-home\n",
+    "project/package.json": JSON.stringify({ name: "app", version: "1.0.0" }),
+  };
+
+  // The file is sparse: the hole takes no disk space and reads back as NUL bytes. bun reads the whole file before the
+  // parser rejects it, so the child needs 2 GiB of memory. NTFS would fill the hole on disk.
+  test.skipIf(isWindows || totalmem() < 10 * 1024 ** 3)(
+    "a .npmrc of 2 GiB or more is not applied, with a warning",
+    async () => {
+      using dir = tempDir("npmrc-too-large", files);
+      // A comment line that ends past 2 GiB, then a key line, which starts past i32::MAX.
+      const head = "cache=from-project\n#";
+      const tail = "\na=b\n";
+      const size = 2 ** 31 + 16;
+      const fd = openSync(join(String(dir), "project", ".npmrc"), "w");
+      try {
+        ftruncateSync(fd, size);
+        writeSync(fd, head, 0);
+        writeSync(fd, tail, size - tail.length);
+      } finally {
+        closeSync(fd);
+      }
+
+      expect(await pmCache(String(dir))).toEqual({
+        stdout: "<dir>/project/from-home",
+        stderr:
+          "warn: INI document is too large to parse (2 GiB maximum)\n" +
+          "The registry and auth settings in .npmrc are not applied.\n",
+        exitCode: 0,
+        signalCode: null,
+      });
+    },
+    120_000,
+  );
+
+  // A quoted key is parsed as JSON, and an array key becomes its string form, which prints 1e99 as 100 digits: this
+  // key is 112 bytes from a file of 24. bun 1.4.0 to 1.4.3 took it for a `certfile` line and aborted on the position
+  // of that word, which they found by a walk back from the value over the parsed key.
+  test("a key longer than its source text does not abort", async () => {
+    using dir = tempDir("npmrc-long-key", { ...files, "project/.npmrc": `'["//:certfile",1e99]'=x` });
+
+    expect(await pmCache(String(dir))).toEqual({
+      stdout: "<dir>/project/from-home",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
   });
 });
 
