@@ -445,9 +445,6 @@ public:
 
     double INSPECT_MAX_BYTES = 50;
     bool isInsideErrorPrepareStackTraceCallback = false;
-    // The offset of Error.prepareStackTrace in m_errorConstructorStructureForPrepareStackTrace, or
-    // invalidOffset for the property that was never written.
-    JSC::PropertyOffset m_errorPrepareStackTraceOffset = JSC::invalidOffset;
 
     template<typename T>
     using LazyPropertyOfGlobalObject = LazyProperty<JSGlobalObject, T>;
@@ -521,11 +518,6 @@ public:
     V(private, ThenablesArray, m_thenables)                                                                  \
     V(private, NativeModuleDefaultsArray, m_nativeModuleDefaults)                                            \
                                                                                                              \
-    /* The Structure the Error constructor had when Error.prepareStackTrace was last found by name. */       \
-    /* While the constructor keeps it, the property is at m_errorPrepareStackTraceOffset. This is */         \
-    /* a location only: the formatter is always read from the property. */                                   \
-    V(public, WriteBarrier<JSC::Structure>, m_errorConstructorStructureForPrepareStackTrace)                 \
-                                                                                                             \
     /* When a napi module initializes on dlopen, we need to know what the value is */                        \
     V(public, NapiModuleAndExports, m_pendingNapiModuleAndExports)                                           \
                                                                                                              \
@@ -545,8 +537,7 @@ public:
     V(private, WriteBarrier<JSObject>, m_nodeWorkerStdioPorts)                                               \
     V(private, LazyPropertyOfGlobalObject<Structure>, m_moduleGraphFrameStructure)                           \
                                                                                                              \
-    /* The default Error.prepareStackTrace, as Node.js has one. The formatter compares the property's */     \
-    /* value with it: a stack that would go through the default is formatted without a call into JS. */      \
+    /* The default Error.prepareStackTrace, as Node.js has one. Native code formats its stacks. */           \
     V(public, LazyPropertyOfGlobalObject<JSC::JSFunction>, m_errorConstructorPrepareStackTraceInternalValue) \
                                                                                                              \
     V(private, LazyPropertyOfGlobalObject<JSObject>, m_nodeErrorCache)                                       \

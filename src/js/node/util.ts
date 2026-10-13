@@ -594,7 +594,6 @@ function getCallSites(frameCount = 10, options) {
   // Using kDefaultMaxCallStackSizeToCapture as reference
   validateInteger(frameCount, "frameCount", 1, 200);
 
-  // A native capture: Error.prepareStackTrace is not called and Error.stackTraceLimit does not count.
   return toCallSiteObjects(captureCallSites(getCallSites, frameCount));
 }
 

@@ -181,9 +181,6 @@ function guardCallback(callback) {
 
 const nodeModulesRE = /[\\/]node_modules[\\/]/;
 
-// captureCallSites(caller, limit): the CallSites of the frames above `caller`. Node.js captures
-// natively for its own use too: the program's Error.prepareStackTrace and Error.stackTraceLimit
-// are not read or written.
 const captureCallSites: (caller: Function, limit: number) => { getFileName(): string | null }[] = $newCppFunction(
   "FormatStackTraceForJS.cpp",
   "jsFunctionCaptureCallSites",
