@@ -63,7 +63,6 @@ const eventIds = {
   open: 1,
   close: 2,
   message: 3,
-  error: 4,
   ping: 5,
   pong: 6,
 };
@@ -116,6 +115,11 @@ function controlPayload(binaryType, data) {
 
 // https://github.com/oven-sh/bun/issues/11866
 let WebSocket;
+// deviation: npm ws keeps onerror and addEventListener('error') handlers on the emitter, so listenerCount('error')
+// includes them. Here they stay on the native socket, and this counts them.
+const nativeListenerCount = $newCppFunction("JSEventTarget.cpp", "jsEventTargetGetEventListenersCount", 2);
+// On a native socket: the client that sends the socket's 'error' to emit("error").
+const kClient = Symbol("client");
 
 /**
  * @link https://github.com/websockets/ws/blob/master/doc/ws.md#class-websocket
@@ -141,6 +145,8 @@ class BunWebSocket extends EventEmitter {
   #onerror;
   // Bitset to track whether event handlers are set.
   #eventId = 0;
+  // close() or terminate() ended the handshake: the 'error' that follows is the caller's own.
+  #closedWhileConnecting = false;
 
   constructor(url, protocols, options) {
     super();
@@ -287,10 +293,36 @@ class BunWebSocket extends EventEmitter {
     } else {
       wsOptions = protocols;
     }
-    let ws = (this.#ws = new WebSocket(url, wsOptions));
-    ws.binaryType = "nodebuffer";
+    const ws = new WebSocket(url, wsOptions);
+    // A `finishRequest` whose `req.end()` comes late dials a second socket. Only the first reports its 'error'.
+    if (this.#ws === undefined) {
+      ws[kClient] = this;
+      // First, and in the capture phase: every other 'error' listener of the socket runs after this one.
+      ws.addEventListener("error", BunWebSocket.#onNativeError, true);
+    }
+    this.#ws = ws;
 
     return ws;
+  }
+
+  // `this` is the native socket. A failed handshake goes to emit("error") whether or not anyone listens.
+  // deviation: npm ws calls on('error'), onerror and addEventListener('error') handlers in the order they were
+  // added. Here the listeners of the emitter run first.
+  static #onNativeError(event) {
+    const client = this[kClient];
+    if (client.#unexpectedResponseEmitted) return;
+    if (client.listenerCount("error") > 0) {
+      client.emit("error", event);
+      return;
+    }
+    // Only a failed handshake carries an Error. A count of 1 is this listener alone: nothing handles the
+    // failure, and emit() throws the Error, as npm ws does.
+    // deviation: npm ws also throws for close() and terminate() while CONNECTING, and emits no 'close' after
+    // the throw. Here a client that ends its own handshake tells only its listeners, and 'close' follows.
+    const error = event.error;
+    if (error !== null && !client.#closedWhileConnecting && nativeListenerCount(this, "error") === 1) {
+      client.emit("error", error);
+    }
   }
 
   #handshakeListenerRegistered = false;
@@ -353,7 +385,7 @@ class BunWebSocket extends EventEmitter {
       this.#unexpectedResponseEmitted = true;
       this.#unexpectedResponseHandled = true;
       this.emit("unexpected-response", this.#getSyntheticRequest(), res);
-    } else if (this.listenerCount("error") > 0) {
+    } else if (this.listenerCount("error") > 0 || nativeListenerCount(this.#ws, "error") === 1) {
       this.#unexpectedResponseEmitted = true;
       this.emit("error", new Error("Unexpected server response: " + statusCode));
     }
@@ -408,15 +440,6 @@ class BunWebSocket extends EventEmitter {
               }
               this.emit("message", this.#fragments ? [encoded] : encoded, isBinary);
             }
-          },
-          once,
-        );
-      } else if (event === "error") {
-        this.#ws.addEventListener(
-          "error",
-          err => {
-            if (this.#unexpectedResponseEmitted) return;
-            this.emit("error", err);
           },
           once,
         );
@@ -497,13 +520,16 @@ class BunWebSocket extends EventEmitter {
   close(code, reason) {
     const ws = this.#ws;
     if (ws) {
+      const connecting = ws.readyState === ReadyState_CONNECTING;
       ws.close(code, reason);
+      if (connecting) this.#closedWhileConnecting = true;
     }
   }
 
   terminate() {
     const ws = this.#ws;
     if (ws) {
+      if (ws.readyState === ReadyState_CONNECTING) this.#closedWhileConnecting = true;
       ws.terminate();
     }
   }
@@ -603,7 +629,8 @@ class BunWebSocket extends EventEmitter {
   set onerror(value) {
     this.#onerror = typeof value === "function" ? value : undefined;
     if (this.#onerror === undefined) {
-      this.#ws.onerror = value;
+      // Not `value`: the native socket would keep an object as a listener that handles nothing.
+      this.#ws.onerror = null;
       return;
     }
     const self = this;

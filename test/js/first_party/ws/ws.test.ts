@@ -3,7 +3,7 @@ import { spawn } from "bun";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import crypto from "crypto";
 import { EventEmitter, once } from "events";
-import { bunEnv, bunExe, isDebug, tls as serverIdentity, tempDir } from "harness";
+import { bunEnv, bunExe, isDebug, isWindows, tls as serverIdentity, tempDir } from "harness";
 import { createServer, request } from "http";
 import https from "https";
 import { HttpsProxyAgent } from "https-proxy-agent";
@@ -336,8 +336,25 @@ describe("WebSocketServer", () => {
       }
     });
 
-    new WebSocket("ws://localhost:" + (wss.address() as AddressInfo).port);
+    // deviation: npm ws sends the 101 before 'connection', so its client gets 'open', then 'close' 1006.
+    // Here a terminate() in that tick drops the corked 101 (#43711), and the client's handshake fails.
+    new WebSocket("ws://localhost:" + (wss.address() as AddressInfo).port).on("error", () => {});
     await promise;
+  });
+
+  it.todo("a client opens before a terminate() in 'connection' closes it", async () => {
+    const wss = new WebSocketServer({ port: 0 });
+    try {
+      wss.on("connection", ws => ws.terminate());
+      const events: string[] = [];
+      const client = new WebSocket("ws://localhost:" + (wss.address() as AddressInfo).port);
+      client.on("open", () => events.push("open"));
+      client.on("error", () => events.push("error"));
+      await new Promise<void>(resolve => client.on("close", code => (events.push("close " + code), resolve())));
+      expect(events).toEqual(["open", "close 1006"]);
+    } finally {
+      wss.close();
+    }
   });
 
   // websockets/ws test/websocket-server.test.js
@@ -1724,6 +1741,317 @@ describe("handleUpgrade on a node:http upgrade socket", () => {
       "server.handleUpgrade() was called more than once with the same socket, possibly due to a misconfiguration",
     );
     expect(connections).toHaveLength(1);
+  });
+});
+
+// Like npm ws, a client sends a failed opening handshake to emit("error") whether or not anyone listens.
+// With no handler of any kind, emit() throws the Error.
+describe("client whose opening handshake fails", () => {
+  async function run(script: string, env: Record<string, string> = {}) {
+    await using child = spawn({
+      cmd: [bunExe(), "-e", script],
+      env: { ...bunEnv, ...env },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([child.stdout.text(), child.stderr.text(), child.exited]);
+    return { stdout: stdout.trim(), stderr, exitCode };
+  }
+
+  it.concurrent.each([
+    ["a refused port, no listener", "", false],
+    ["a refused port, 'open' and 'message' listeners", `ws.on("open", () => console.log("open")); ws.on("message", () => {});`, false], // prettier-ignore
+    ["a 404 answer, an 'open' listener", `ws.on("open", () => console.log("open"));`, true],
+  ])("%s: the process prints the Error and exits with 1", async (_form, listeners, answered) => {
+    await using server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response("no", { status: 404 }),
+    });
+    const url = answered ? `ws://127.0.0.1:${server.port}/` : "ws://127.0.0.1:1/";
+    const { stdout, stderr, exitCode } = await run(
+      `const { WebSocket } = require("ws"); const ws = new WebSocket(process.env.TARGET); ${listeners}`,
+      { TARGET: url },
+    );
+    // deviation: the message is the native socket's. npm ws: "connect ECONNREFUSED 127.0.0.1:1" with a
+    // `code`, and "Unexpected server response: 404".
+    const reason = answered ? "Expected 101 status code" : "Failed to connect";
+    expect({ stdout, errors: stderr.split(/\r?\n/).filter(line => line.startsWith("error: ")), exitCode }).toEqual({
+      stdout: "",
+      errors: [`error: WebSocket connection to '${url}' failed: ${reason}`],
+      exitCode: 1,
+    });
+  });
+
+  // One child runs every row: a client, what its listeners heard, and what reached 'uncaughtException'.
+  const fixture = (rows: string) => String.raw`
+    const { once, errorMonitor } = require("node:events");
+    const { WebSocket } = require("ws");
+
+    // Each server fails the opening handshake in its own way.
+    const listen = socket => Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, ...socket } });
+    const switching = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
+    const accept = request =>
+      new Bun.CryptoHasher("sha1")
+        .update(/sec-websocket-key: (.*)\r\n/i.exec(request)[1] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+        .digest("base64");
+    let held, lateRequest;
+    const servers = {
+      ended: listen({ open: socket => socket.end() }),
+      silent: listen({}),
+      held: listen({ open: socket => held.resolve(socket) }),
+      wrongAccept: listen({ data: socket => socket.write(switching + "AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n") }),
+      // Opens, then goes away with no Close frame.
+      lost: listen({ data: (socket, request) => (socket.write(switching + accept(String(request)) + "\r\n\r\n"), socket.end()) }),
+      notFound: Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("no", { status: 404 }) }),
+    };
+    const url = name => "ws://127.0.0.1:" + servers[name].port + "/";
+    const missingSocket = "ws+unix://" + process.env.MISSING_SOCKET;
+
+    const show = value =>
+      (value instanceof Error ? "Error" : value?.constructor?.name) +
+      ": " +
+      String(value?.message).replace(/:\d+\//, ":<port>/").replace(process.env.MISSING_SOCKET, "<socket>");
+    const hear = (heard, as) => value => heard.push(as + " " + show(value));
+    const uncaught = [];
+    process.on("uncaughtException", error => uncaught.push(show(error)));
+
+    const results = {};
+    async function run(name, target, arm, Client = WebSocket) {
+      const heard = [];
+      uncaught.length = 0;
+      const ws = new Client(target);
+      // A 'close' listener of the native socket: not a handler of 'error' for anyone.
+      const closed = new Promise(resolve => ws.addEventListener("close", resolve));
+      await arm?.(ws, heard);
+      await closed;
+      results[name] = { heard, uncaught: [...uncaught] };
+    }
+    ${rows}
+    for (const server of Object.values(servers)) server.stop(true);
+    console.log(JSON.stringify(results));
+  `;
+
+  const failed = (reason: string, url = "ws://127.0.0.1:<port>/") =>
+    `WebSocket connection to '${url}' failed: ${reason}`;
+  const ended = failed("Connection ended");
+  const aborted = failed("WebSocket is closed before the connection is established");
+  const thrown = (error: string, heard: string[] = []) => ({ heard, uncaught: ["Error: " + error] });
+  const handled = (...heard: string[]) => ({ heard, uncaught: [] });
+
+  it("emits 'error' once, and throws the Error when nothing handles it", async () => {
+    using dir = tempDir("ws-missing-socket", {});
+    const { stdout, stderr, exitCode } = await run(
+      fixture(String.raw`
+        // Nothing handles the 'error': emit() throws the Error.
+        await run("no listener", url("ended"));
+        await run("'open' and 'message' listeners", url("ended"), ws => {
+          ws.on("open", () => {});
+          ws.on("message", () => {});
+        });
+        await run("'close' listener", url("ended"), (ws, heard) => ws.on("close", code => heard.push("close " + code)));
+        await run("'error' listener added, then removed", url("ended"), (ws, heard) => {
+          const listener = hear(heard, "removed");
+          ws.on("error", listener);
+          ws.off("error", listener);
+        });
+        await run("errorMonitor", url("ended"), (ws, heard) => ws.on(errorMonitor, hear(heard, "monitor")));
+        await run("onerror set, then set to null", url("ended"), (ws, heard) => {
+          ws.onerror = hear(heard, "onerror");
+          ws.onerror = null;
+        });
+        await run("onerror set to an object", url("ended"), ws => (ws.onerror = {}));
+        await run("addEventListener, then removeEventListener", url("ended"), (ws, heard) => {
+          const listener = hear(heard, "removed");
+          ws.addEventListener("error", listener);
+          ws.removeEventListener("error", listener);
+        });
+        await run("subclass", url("ended"), undefined, class extends WebSocket {});
+        await run("answered 404", url("notFound"));
+        await run("wrong Sec-WebSocket-Accept", url("wrongAccept"));
+        if (process.platform !== "win32") await run("missing unix socket", missingSocket);
+        await run("finishRequest", url("ended"), undefined, function (target) {
+          return new WebSocket(target, { finishRequest: request => request.end() });
+        });
+        {
+          // Nothing but the native socket refers to the client when its handshake fails.
+          uncaught.length = 0;
+          held = Promise.withResolvers();
+          const closed = (() => new Promise(resolve => new WebSocket(url("held")).addEventListener("close", resolve)))();
+          const socket = await held.promise;
+          Bun.gc(true);
+          socket.end();
+          await closed;
+          results["no reference to the client"] = { heard: [], uncaught: [...uncaught] };
+        }
+
+        // A listener of the emitter gets the event, once.
+        await run("on", url("ended"), (ws, heard) => ws.on("error", hear(heard, "on")));
+        await run("once", url("ended"), (ws, heard) => ws.once("error", hear(heard, "once")));
+        await run("once, then on", url("ended"), (ws, heard) => {
+          ws.once("error", hear(heard, "once"));
+          ws.on("error", hear(heard, "on"));
+        });
+        await run("prependListener", url("ended"), (ws, heard) => ws.prependListener("error", hear(heard, "prepend")));
+        await run("prependOnceListener", url("ended"), (ws, heard) => ws.prependOnceListener("error", hear(heard, "prepend")));
+        await run("events.once(ws, 'open')", url("ended"), (ws, heard) => void once(ws, "open").catch(hear(heard, "rejected")));
+        await run("listener that throws", url("ended"), ws =>
+          ws.on("error", () => {
+            throw new Error("thrown by the listener");
+          }),
+        );
+        // The second socket of a late request.end() does not report: one 'error', not two.
+        await run(
+          "finishRequest that ends late",
+          url("ended"),
+          async (ws, heard) => {
+            ws.on("error", hear(heard, "on"));
+            await new Promise(resolve => ws.addEventListener("close", resolve));
+            lateRequest.end();
+            await new Promise(resolve => ws.addEventListener("close", resolve));
+          },
+          function (target) {
+            return new WebSocket(target, { finishRequest: request => void (lateRequest = request) });
+          },
+        );
+
+        // A handler on the native socket is a handler: it gets the event, and nothing is thrown.
+        await run("onerror", url("ended"), (ws, heard) => (ws.onerror = hear(heard, "onerror")));
+        await run("addEventListener", url("ended"), (ws, heard) => ws.addEventListener("error", hear(heard, "listener")));
+        await run("addEventListener, handleEvent", url("ended"), (ws, heard) =>
+          ws.addEventListener("error", { handleEvent: hear(heard, "handleEvent") }),
+        );
+        await run("addEventListener, once", url("ended"), (ws, heard) =>
+          ws.addEventListener("error", hear(heard, "listener"), { once: true }),
+        );
+        await run("addEventListener, capture and once", url("ended"), (ws, heard) =>
+          ws.addEventListener("error", hear(heard, "listener"), { capture: true, once: true }),
+        );
+        await run("onerror, then on", url("ended"), (ws, heard) => {
+          ws.onerror = hear(heard, "onerror");
+          ws.on("error", hear(heard, "on"));
+        });
+
+        // A client that ends its own handshake tells only its listeners.
+        await run("close() while CONNECTING", url("silent"), ws => ws.close());
+        await run("terminate() while CONNECTING", url("silent"), ws => ws.terminate());
+        await run("terminate() while CONNECTING, on", url("silent"), (ws, heard) => {
+          ws.on("error", hear(heard, "on"));
+          ws.terminate();
+        });
+
+        // Not a failed handshake, and not a client of "ws": nothing is emitted or thrown.
+        await run("connection lost after 'open'", url("lost"), (ws, heard) => {
+          ws.on("open", () => heard.push("open"));
+          ws.on("error", hear(heard, "on"));
+        });
+        await run("connection lost after 'open', no listener", url("lost"));
+        await run("global WebSocket", url("ended"), undefined, globalThis.WebSocket);
+      `),
+      { MISSING_SOCKET: path.join(String(dir), "missing.sock") },
+    );
+    expect({ results: stdout.startsWith("{") ? JSON.parse(stdout) : stdout, stderr, exitCode }).toEqual({
+      results: {
+        "no listener": thrown(ended),
+        "'open' and 'message' listeners": thrown(ended),
+        // deviation: npm ws emits no 'close' after an 'error' that it threw.
+        "'close' listener": thrown(ended, ["close 1006"]),
+        "'error' listener added, then removed": thrown(ended),
+        "errorMonitor": thrown(ended, ["monitor Error: " + ended]),
+        "onerror set, then set to null": thrown(ended),
+        "onerror set to an object": thrown(ended),
+        "addEventListener, then removeEventListener": thrown(ended),
+        "subclass": thrown(ended),
+        "answered 404": thrown(failed("Expected 101 status code")),
+        "wrong Sec-WebSocket-Accept": thrown(failed("Mismatch websocket accept header")),
+        ...(isWindows ? {} : { "missing unix socket": thrown(failed("Failed to connect", "ws+unix://<socket>")) }),
+        "finishRequest": thrown(ended),
+        "no reference to the client": thrown(ended),
+
+        // deviation: npm ws gives these listeners an Error.
+        "on": handled("on ErrorEvent: " + ended),
+        "once": handled("once ErrorEvent: " + ended),
+        "once, then on": handled("once ErrorEvent: " + ended, "on ErrorEvent: " + ended),
+        "prependListener": handled("prepend ErrorEvent: " + ended),
+        "prependOnceListener": handled("prepend ErrorEvent: " + ended),
+        "events.once(ws, 'open')": handled("rejected ErrorEvent: " + ended),
+        "listener that throws": thrown("thrown by the listener"),
+        "finishRequest that ends late": handled("on ErrorEvent: " + ended),
+
+        "onerror": handled("onerror ErrorEvent: " + ended),
+        "addEventListener": handled("listener ErrorEvent: " + ended),
+        "addEventListener, handleEvent": handled("handleEvent ErrorEvent: " + ended),
+        "addEventListener, once": handled("listener ErrorEvent: " + ended),
+        "addEventListener, capture and once": handled("listener ErrorEvent: " + ended),
+        // deviation: npm ws calls handlers in the order they were added, so onerror first.
+        "onerror, then on": handled("on ErrorEvent: " + ended, "onerror ErrorEvent: " + ended),
+
+        // deviation: npm ws throws "WebSocket was closed before the connection was established" for the first two.
+        "close() while CONNECTING": handled(),
+        "terminate() while CONNECTING": handled(),
+        "terminate() while CONNECTING, on": handled("on ErrorEvent: " + aborted),
+
+        "connection lost after 'open'": handled("open"),
+        "connection lost after 'open', no listener": handled(),
+        "global WebSocket": handled(),
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  // 'upgrade' and 'unexpected-response' listeners make the client read the answer itself.
+  it("emits 'Unexpected server response' for a non-101 answer by the same rule", async () => {
+    const { stdout, stderr, exitCode } = await run(
+      fixture(String.raw`
+        await run("'upgrade' listener", url("notFound"), ws => ws.on("upgrade", () => {}));
+        await run("'upgrade' listener and onerror set to an object", url("notFound"), ws => {
+          ws.on("upgrade", () => {});
+          ws.onerror = {};
+        });
+        await run("'upgrade' and 'error' listeners", url("notFound"), (ws, heard) => {
+          ws.on("upgrade", () => {});
+          ws.on("error", hear(heard, "on"));
+        });
+        await run("'upgrade' listener and onerror", url("notFound"), (ws, heard) => {
+          ws.on("upgrade", () => {});
+          ws.onerror = hear(heard, "onerror");
+        });
+        await run("'unexpected-response' listener", url("notFound"), (ws, heard) =>
+          ws.on("unexpected-response", (request, response) => heard.push("unexpected-response " + response.statusCode)),
+        );
+      `),
+    );
+    expect({ results: stdout.startsWith("{") ? JSON.parse(stdout) : stdout, stderr, exitCode }).toEqual({
+      results: {
+        "'upgrade' listener": thrown("Unexpected server response: 404"),
+        "'upgrade' listener and onerror set to an object": thrown("Unexpected server response: 404"),
+        "'upgrade' and 'error' listeners": handled("on Error: Unexpected server response: 404"),
+        // deviation: npm ws gives onerror "Unexpected server response: 404" too.
+        "'upgrade' listener and onerror": handled("onerror ErrorEvent: " + failed("Expected 101 status code")),
+        "'unexpected-response' listener": handled("unexpected-response 404"),
+      },
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("fails the Worker that has the client when nothing handles it", async () => {
+    const { stdout, stderr, exitCode } = await run(String.raw`
+      const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {}, open: socket => socket.end() } });
+      const client = 'const { WebSocket } = require("ws"); new WebSocket("ws://127.0.0.1:' + server.port + '/");';
+      const worker = new Worker(URL.createObjectURL(new Blob([client])));
+      worker.addEventListener("error", event => console.log(event.message.trim().replace(/:\d+\//, ":<port>/")));
+      worker.addEventListener("close", event => {
+        console.log("exit code " + event.code);
+        server.stop(true);
+      });
+    `);
+    expect({ stdout: stdout.split(/\r?\n/), stderr, exitCode }).toEqual({
+      stdout: ["error: " + ended, "exit code 1"],
+      stderr: "",
+      exitCode: 0,
+    });
   });
 });
 
