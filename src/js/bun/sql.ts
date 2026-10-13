@@ -211,12 +211,12 @@ const SQL = function SQL(
 
   // SQLite ends a transaction by itself inside a failing statement. Its adapter records which begin() the connection runs.
   function lostTransaction(transactionQueries) {
-    return pool.noteFailedStatement !== undefined && pool.transaction !== transactionQueries;
+    return pool.noteFailedStatement !== undefined && pool.openTransaction !== transactionQueries;
   }
 
   // A statement of a begin() that lost its transaction would run in autocommit, or inside the next begin().
   function queryFromOwnedTransactionHandler(transactionQueries, query, handle, err) {
-    if (pool.transaction !== transactionQueries && !err && !query.cancelled) {
+    if (pool.openTransaction !== transactionQueries && !err && !query.cancelled) {
       transactionQueries.delete(query);
       return query.reject(
         pool.invalidTransactionStateError(
@@ -237,7 +237,7 @@ const SQL = function SQL(
     if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
       pool.noteFailedStatement!(this);
     } else if (!err && !query.cancelled) {
-      pool.transaction = transactionQueries;
+      pool.openTransaction = transactionQueries;
     }
   }
 
