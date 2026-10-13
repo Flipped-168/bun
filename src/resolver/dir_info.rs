@@ -115,9 +115,6 @@ pub struct DirInfo {
     /// it's the deepest one in the hierarchy with a "name" field
     /// or, if using `bun run`, the name field is optional
     /// https://github.com/oven-sh/bun/issues/229
-    ///
-    /// It passes over a package.json that did not load, as if there were none.
-    /// [`DirInfo::script_package`] does not.
     // No write site exists in any caller — kept `Option<&'static>` for
     // ergonomics. If a write is ever added, retype to `Option<NonNull<_>>`.
     pub enclosing_package_json: Option<&'static PackageJSON>,
@@ -138,8 +135,7 @@ pub struct DirInfo {
     // lifetime — slice into BSS-backed path storage; never individually freed
     pub abs_path: &'static [u8],
     pub(crate) entries: Index,
-    /// The "package.json" file of this directory. `None` where there is none, and where there
-    /// is one that did not load: `package_json_load_error` tells the two apart.
+    /// Is there a "package.json" file?
     // `NonNull` (not `&'static`) preserves mut-provenance. Read via `.package_json()`.
     pub package_json: Option<NonNull<PackageJSON>>,
     /// Is there a "tsconfig.json" file in this directory or a parent directory?
@@ -161,8 +157,7 @@ const _: () = assert!(core::mem::size_of::<DirInfo>() == 104);
 #[derive(Clone, Copy)]
 pub enum ScriptPackage {
     Loaded(&'static PackageJSON),
-    /// The nearest "package.json", the file in `dir`, did not load. That of a package further up
-    /// is not the one of this directory.
+    /// The nearest "package.json", the file in `dir`, did not load.
     Unloadable {
         dir: &'static [u8],
         error: LoadError,
@@ -231,8 +226,7 @@ impl DirInfo {
         self.package_json.map(arena_ref)
     }
 
-    /// The nearest package.json, of this directory or of one above it: the one whose scripts
-    /// `bun run` runs.
+    /// The nearest package.json, the one whose scripts `bun run` runs.
     #[inline]
     pub fn script_package(&self) -> ScriptPackage {
         if self.package_json.is_none() {

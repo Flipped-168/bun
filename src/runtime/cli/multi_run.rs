@@ -1063,19 +1063,19 @@ pub(crate) fn run(ctx: &mut Command::ContextData) -> Result<core::convert::Infal
             }
         };
 
-        let script_package = root_dir_info.script_package();
-        let scripts_map: Option<&ScriptsMap> = match script_package {
+        let scripts_map: Option<&ScriptsMap> = match root_dir_info.script_package() {
             ScriptPackage::Loaded(package_json) => package_json.scripts.as_deref(),
-            ScriptPackage::Unloadable { .. } | ScriptPackage::Absent => None,
+            ScriptPackage::Unloadable { dir, error } => {
+                // A name that is no file can be a script that is there.
+                if script_names.iter().any(|name| !runs_as_file(name)) {
+                    RunCommand::print_unloadable_package_json(ctx, dir, error);
+                }
+                None
+            }
+            ScriptPackage::Absent => None,
         };
 
         for raw_name in &script_names {
-            // Which scripts there are is not known. What is not a file can be one.
-            if let ScriptPackage::Unloadable { dir, error } = script_package {
-                if strings::contains_char(raw_name, b'*') || !runs_as_file(raw_name) {
-                    RunCommand::exit_with_unloadable_package_json(ctx, dir, error);
-                }
-            }
             // Check if this is a glob pattern
             if strings::contains_char(raw_name, b'*') {
                 if let Some(sm) = scripts_map {

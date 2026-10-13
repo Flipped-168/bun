@@ -4118,14 +4118,16 @@ impl<'a> Resolver<'a> {
                 include_scripts,
             )
         };
-        match pkg {
-            // NOTE: the DirInfo cache holds `&'static` refs. PORTING.md
-            // §Forbidden bars `Box::leak`; intern into the process-lifetime arena
-            // owned alongside the DirInfo singleton instead.
-            Load::Loaded(pkg) => Load::Loaded(intern_package_json(pkg)),
-            Load::Absent => Load::Absent,
-            Load::Failed(error) => Load::Failed(error),
-        }
+        let pkg = match pkg {
+            Load::Loaded(pkg) => pkg,
+            Load::Absent => return Load::Absent,
+            Load::Failed(error) => return Load::Failed(error),
+        };
+
+        // NOTE: the DirInfo cache holds `&'static` refs. PORTING.md
+        // §Forbidden bars `Box::leak`; intern into the process-lifetime arena
+        // owned alongside the DirInfo singleton instead.
+        Load::Loaded(intern_package_json(pkg))
     }
 
     fn dir_info_cached(&mut self, path: &[u8]) -> crate::CrateResult<Option<DirInfoRef>> {

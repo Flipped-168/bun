@@ -225,7 +225,7 @@ When a `package.json` script and a file have the same name, `bun run` prefers th
 3. Binaries from project packages: `bun add eslint && bun run eslint`
 4. (`bun run` only) System commands: `bun run ls`
 
-If the nearest `package.json` has a syntax error, `bun run` cannot read its scripts. It does not run the scripts of a `package.json` in a parent directory. If the other steps also find nothing to run, `bun run` prints the syntax error and exits with code 1.
+If the nearest `package.json` has a syntax error, `bun run` cannot read its scripts, and it does not use the scripts of a `package.json` in a parent directory. It prints the syntax error and continues with the other steps. If they find nothing to run, it exits with code 1, also with `--if-present`.
 
 ---
 

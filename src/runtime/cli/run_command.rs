@@ -2349,8 +2349,7 @@ impl RunCommand {
         }
     }
 
-    /// Says why the nearest package.json, the file in `dir`, did not load. Which scripts there are
-    /// is then not known, and those of a package further up are not the scripts of this one.
+    /// Says why the nearest package.json, the file in `dir`, did not load.
     #[cold]
     #[inline(never)]
     pub(crate) fn print_unloadable_package_json(
@@ -2365,8 +2364,7 @@ impl RunCommand {
         let file = (bstr::BStr::new(&path),);
         match error {
             LoadError::Syntax => {
-                // SAFETY: `ctx.log` set in `create_context_data` (single-threaded CLI startup),
-                // process-lifetime. The resolver that wrote to it is not running.
+                // SAFETY: `ctx.log` is the process-lifetime log of the CLI, and no resolver runs.
                 let log = unsafe { ctx.log() };
                 // The log also has what is wrong with other files, like a tsconfig.json.
                 log.msgs.retain(|msg| {
@@ -2384,19 +2382,8 @@ impl RunCommand {
                 Output::err_generic("package.json root must be an object: '{}'", file);
             }
         }
-    }
-
-    /// [`Self::print_unloadable_package_json`], and nothing runs.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn exit_with_unloadable_package_json(
-        ctx: &mut ContextData,
-        dir: &[u8],
-        error: LoadError,
-    ) -> ! {
-        Self::print_unloadable_package_json(ctx, dir, error);
+        // Ahead of what an executable that runs next writes.
         Output::flush();
-        Global::exit(1);
     }
 
     /// Dispatch `bun run <target>`: classify as file path vs. package.json
@@ -2503,7 +2490,8 @@ impl RunCommand {
             match script_package {
                 ScriptPackage::Loaded(package_json) => Self::print_help(Some(package_json)),
                 ScriptPackage::Unloadable { dir, error } => {
-                    Self::exit_with_unloadable_package_json(ctx, dir, error)
+                    Self::print_unloadable_package_json(ctx, dir, error);
+                    Global::exit(1);
                 }
                 ScriptPackage::Absent => {
                     Self::print_help(None);
@@ -2707,6 +2695,15 @@ impl RunCommand {
             }
         }
 
+        // What is left is an executable, or nothing. The name can also be a script that is there.
+        let unloadable = match script_package {
+            ScriptPackage::Unloadable { dir, error } if !skip_script_check => {
+                Self::print_unloadable_package_json(ctx, dir, error);
+                true
+            }
+            _ => false,
+        };
+
         // ── Windows .bunx fast-path ──────────────────────────────────────────
         // With `--check` the way below is taken, on which the project is checked.
         #[cfg(windows)]
@@ -2790,17 +2787,10 @@ impl RunCommand {
         }
 
         // ── failure ─────────────────────────────────────────────────────────
-        if !skip_script_check {
-            if let ScriptPackage::Unloadable { dir, error } = script_package {
-                // It can be a script that is there.
-                if ctx.runtime_options.if_present {
-                    Self::exit_with_unloadable_package_json(ctx, dir, error);
-                }
-                Self::print_unloadable_package_json(ctx, dir, error);
-            }
-        }
-
         if ctx.runtime_options.if_present {
+            if unloadable {
+                Global::exit(1);
+            }
             return Ok(true);
         }
 

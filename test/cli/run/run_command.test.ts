@@ -68,6 +68,7 @@ describe.concurrent("a package.json that does not parse", () => {
   };
   const [text, error] = unparsable["a missing brace"];
   const withLine = (line: string) => `${error}\nerror: ${line}`;
+  const timed = (stderr: string) => stderr.replace(/Done in [\d.]+ ?m?s/g, "Done in <time>");
 
   // A package in `child`, in a package that has the same script.
   const project = (child: Record<string, string>) =>
@@ -119,16 +120,31 @@ describe.concurrent("a package.json that does not parse", () => {
     expect(await run(String(dir), cwd, args)).toEqual({ stdout: "", stderr, exitCode: 1 });
   });
 
-  // What is not a file can be a script.
-  test.each([
-    [["run", "--parallel", "greet"]],
-    [["run", "--sequential", "greet"]],
-    [["run", "--parallel", "gre*"]],
-    [["run", "--parallel", "echo raw"]],
-    [["run", "--parallel", "./x.js", "greet"]],
-  ])("bun %j runs nothing", async args => {
+  // `--parallel` and `--sequential` give a name that is no script and no file to the shell.
+  test.each(["--parallel", "--sequential"])("bun run %s: the script further up does not run", async flag => {
     using dir = project({ "package.json": text });
-    expect(await run(String(dir), "child", args)).toEqual({ stdout: "", stderr: error, exitCode: 1 });
+    const { stdout, stderr, exitCode } = await run(String(dir), "child", ["run", flag, "greet"]);
+    expect(stderr).toStartWith(error + "\n");
+    expect({ stdout, exitCode: exitCode === 0 ? 0 : "not 0" }).toEqual({ stdout: "", exitCode: "not 0" });
+  });
+
+  test("bun run --parallel: a pattern matches no script", async () => {
+    using dir = project({ "package.json": text });
+    expect(await run(String(dir), "child", ["run", "--parallel", "gre*"])).toEqual({
+      stdout: "",
+      stderr: withLine(`Cannot use glob pattern "gre*" without package.json scripts`),
+      exitCode: 1,
+    });
+  });
+
+  test("bun run --parallel: a command still runs", async () => {
+    using dir = project({ "package.json": text });
+    const { stdout, stderr, exitCode } = await run(String(dir), "child", ["run", "--parallel", "echo raw"]);
+    expect({ stdout, stderr: timed(stderr), exitCode }).toEqual({
+      stdout: "echo raw | raw",
+      stderr: `${error}\necho raw | Done in <time>`,
+      exitCode: 0,
+    });
   });
 
   test("what is wrong with another file is not said", async () => {
@@ -157,19 +173,6 @@ describe.concurrent("a package.json that does not parse", () => {
     expect(await run(String(dir), "child", ["run", "beside"])).toEqual({
       stdout: "",
       stderr: withLine(`Script not found "beside"`),
-      exitCode: 1,
-    });
-  });
-
-  // These run the script of that name where there is one.
-  test.each(["check", "lint", "format"])("bun %s", async command => {
-    using dir = tempDir("run-unparsable-package-json-command", {
-      "package.json": `{\n  "scripts": {\n    "${command}": "echo from-script"\n  }\n`,
-      "a.ts": `export const a: number = 1;\n`,
-    });
-    expect(await run(String(dir), ".", [command])).toEqual({
-      stdout: "",
-      stderr: `4 |   }\n       ^\nerror: Expected "}" but found end of file\n    at <dir>/package.json:4:4\nerror: Script not found "${command}"`,
       exitCode: 1,
     });
   });
@@ -208,10 +211,13 @@ describe.concurrent("a package.json that does not parse", () => {
     expect(await run(String(dir), "child", args, stdin)).toEqual(expected);
   });
 
+  // The process of the file says what is wrong as it exits, as above.
   test.each(["x.js", "./x.js"])("a file still runs: bun run --parallel %s", async file => {
     using dir = project({ "package.json": text });
-    expect(await run(String(dir), "child", ["run", "--parallel", file])).toMatchObject({
+    const { stdout, stderr, exitCode } = await run(String(dir), "child", ["run", "--parallel", file]);
+    expect({ stdout, stderr: timed(stderr), exitCode }).toEqual({
       stdout: `${file} | ran`,
+      stderr: `${error.replaceAll(/^/gm, `${file} | `)}\n${file} | Done in <time>`,
       exitCode: 0,
     });
   });
@@ -221,25 +227,26 @@ describe.concurrent("a package.json that does not parse", () => {
       "package.json": text,
       "x.test.js": `import { expect, test } from "bun:test";\ntest("ran", () => expect(1).toBe(1));`,
     });
-    expect(await run(String(dir), "child", ["test", "./x.test.js"])).toMatchObject({
+    expect(await run(String(dir), "child", ["test", "./x.test.js"])).toEqual({
+      stdout: "bun test <version> (<revision>)",
       stderr: `x.test.js:\n(pass) ran\n${error}\n\n 1 pass\n 0 fail\n 1 expect() calls\nRan 1 test across 1 file.`,
       exitCode: 0,
     });
   });
 
-  // A file that starts with `#!` is no executable on Windows.
-  test.skipIf(isWindows).each([["run"], ["x"]])(
-    "an executable that a package installs still runs: bun %s",
-    async command => {
-      using dir = project({ "package.json": text, "node_modules/.bin/installed": "#!/bin/sh\necho from-bin\n" });
-      chmodSync(join(String(dir), "child/node_modules/.bin/installed"), 0o755);
-      expect(await run(String(dir), "child", [command, "installed"])).toEqual({
-        stdout: "from-bin",
-        stderr: "",
-        exitCode: 0,
-      });
-    },
-  );
+  // A file that starts with `#!` is no executable on Windows. `bun run` says what is wrong before it runs one.
+  test.skipIf(isWindows).each([
+    ["run", error],
+    ["x", ""],
+  ])("an executable that a package installs still runs: bun %s", async (command, stderr) => {
+    using dir = project({ "package.json": text, "node_modules/.bin/installed": "#!/bin/sh\necho from-bin\n" });
+    chmodSync(join(String(dir), "child/node_modules/.bin/installed"), 0o755);
+    expect(await run(String(dir), "child", [command, "installed"])).toEqual({
+      stdout: "from-bin",
+      stderr,
+      exitCode: 0,
+    });
+  });
 
   test.each([
     ["child", ["run", "greet"], { stdout: "from-child", stderr: "$ echo from-child", exitCode: 0 }],

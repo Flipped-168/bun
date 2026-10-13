@@ -167,8 +167,7 @@ pub enum LoadError {
     NotAnObject,
 }
 
-/// What [`PackageJSON::parse`] found. Not an `Option`, so that a file that did not load cannot be
-/// taken for one that is not there.
+/// What [`PackageJSON::parse`] found: a file that did not load is not one that is not there.
 pub enum Load<T> {
     Loaded(T),
     /// There is no file, or none that can be read.
