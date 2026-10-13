@@ -424,7 +424,7 @@ impl BuildCommand {
 
         let mut src_root_dir_buf = bun_paths::path_buffer_pool::get();
         let src_root_dir: &[u8] = 'brk1: {
-            let path: &[u8] = 'brk2: {
+            let mut path: &[u8] = 'brk2: {
                 if !ctx.bundler_options.root_dir.is_empty() {
                     break 'brk2 &ctx.bundler_options.root_dir;
                 }
@@ -443,9 +443,19 @@ impl BuildCommand {
                 resolve_path::get_if_exists_longest_common_path(&entries).unwrap_or(b".")
             };
 
+            let mut opened = bun_sys::open_dir_at(Fd::cwd(), path);
+            if let Err(err) = &opened
+                && ctx.bundler_options.root_dir.is_empty()
+                && options::default_root_can_be_missing(err, &this_transpiler.options.entry_points)
+            {
+                this_transpiler.options.missing_default_root_dir = path.into();
+                path = b".";
+                opened = bun_sys::open_dir_at(Fd::cwd(), path);
+            }
+
             // `bun_sys::Dir` is the owning RAII
             // handle; its Drop closes the fd when this block ends.
-            let dir = match bun_sys::open_dir_at(Fd::cwd(), path) {
+            let dir = match opened {
                 Ok(d) => bun_sys::Dir { fd: d },
                 Err(err) => {
                     bun_core::pretty_errorln!(
@@ -638,6 +648,8 @@ impl BuildCommand {
         let opt_output_format = this_transpiler.options.output_format;
         let opt_source_map = this_transpiler.options.source_map;
         let opt_transform_only = this_transpiler.options.transform_only;
+        let opt_missing_default_root_dir =
+            !this_transpiler.options.missing_default_root_dir.is_empty();
         let env_ptr = this_transpiler.env;
 
         let mut output_files: Vec<options::OutputFile> = 'brk: {
@@ -846,6 +858,15 @@ impl BuildCommand {
             let mut root_path: &[u8] = output_dir;
             if root_path.is_empty() && ctx.args.entry_points.len() == 1 {
                 root_path = bun_core::dirname(&ctx.args.entry_points[0]).unwrap_or(b".");
+                // `make_open_path` below would create this directory.
+                if opt_missing_default_root_dir {
+                    bun_core::pretty_errorln!(
+                        "<r><red>error<r><d>:<r> Cannot write the output files next to the entry point: {} is not a directory. Use <b>--outdir<r>",
+                        bun_fmt::quote(root_path),
+                    );
+                    Output::flush();
+                    exit_or_watch(1, ctx.debug.hot_reload == HotReload::Watch);
+                }
             }
 
             let root_dir = if root_path.is_empty() || root_path == b"." {
