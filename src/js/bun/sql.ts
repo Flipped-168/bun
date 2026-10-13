@@ -230,7 +230,8 @@ const SQL = function SQL(
     }
   }
 
-  const transactionHandler = pool.noteFailedStatement ? queryFromOwnedTransactionHandler : queryFromTransactionHandler;
+  // `var`: the functions below read it for every query, and a `const` costs each read a TDZ check.
+  var transactionHandler = pool.noteFailedStatement ? queryFromOwnedTransactionHandler : queryFromTransactionHandler;
 
   function beginFromTransactionHandler(transactionQueries, query, handle, err) {
     if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
