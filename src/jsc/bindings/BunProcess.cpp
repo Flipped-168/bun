@@ -490,19 +490,20 @@ JSC_DEFINE_HOST_FUNCTION_WITH_ATTRIBUTES(Process_functionDlopen, __attribute__((
     WTF::String filename = callFrame->uncheckedArgument(1).toWTFString(globalObject);
     RETURN_IF_EXCEPTION(scope, {});
 
-    if (filename.isEmpty()) {
-        JSC::throwTypeError(globalObject, scope, "dlopen requires a non-empty string as the second argument"_s);
-        return {};
-    }
-
     if (filename.startsWith("file://"_s)) {
-        WTF::URL fileURL = WTF::URL(filename);
-        if (!fileURL.isValid() || !fileURL.protocolIsFile()) {
+        auto path = WTF::URL(filename).fileSystemPath();
+        if (!path) {
             JSC::throwTypeError(globalObject, scope, "invalid file: URL passed to dlopen"_s);
             return {};
         }
 
-        filename = fileURL.fileSystemPath();
+        filename = WTF::move(*path);
+    }
+
+    // After the conversion: on Windows "file:///" has the empty path.
+    if (filename.isEmpty()) {
+        JSC::throwTypeError(globalObject, scope, "dlopen requires a non-empty string as the second argument"_s);
+        return {};
     }
 
     UTF8CString utf8;

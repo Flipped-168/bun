@@ -125,11 +125,8 @@ static WTF::String formatLocation(const WTF::String& url, int lineNumber)
     if (url.isEmpty())
         return "[native code]"_s;
 
-    // Extract path from file:// URL using WTF::URL
-    WTF::String path = url;
-    WTF::URL parsedUrl { url };
-    if (parsedUrl.isValid() && parsedUrl.protocolIsFile())
-        path = parsedUrl.fileSystemPath();
+    // The path of a file: URL. Else the name as it is, also for a path that does not percent-decode to UTF-8.
+    WTF::String path = WTF::URL { url }.fileSystemPath().value_or(url);
 
     if (lineNumber >= 0) {
         WTF::StringBuilder sb;

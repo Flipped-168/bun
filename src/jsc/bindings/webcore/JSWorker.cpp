@@ -347,6 +347,15 @@ template<> __attribute__((minsize)) JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES
     auto* structure = structureForNewTarget<Worker>(lexicalGlobalObject, callFrame);
     RETURN_IF_EXCEPTION(throwScope, {});
 
+    // Before anything below swaps process.env or detaches the transfer list.
+    auto converted = Worker::convertFileURLToPath(scriptUrl);
+    for (size_t i = 0; !converted.hasException() && i < options.preloadModules.size(); i++)
+        converted = Worker::convertFileURLToPath(options.preloadModules[i]);
+    if (converted.hasException()) {
+        WebCore::propagateException(*lexicalGlobalObject, throwScope, converted.releaseException());
+        RELEASE_AND_RETURN(throwScope, {});
+    }
+
     // Resolve the spawning thread's env tree (founding one if needed) so disjoint
     // SHARE_ENV chains stay isolated. Runs only after every option validated,
     // because founding a tree swaps this thread's process.env.

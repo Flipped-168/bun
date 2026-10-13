@@ -185,6 +185,7 @@
 #include "v8/shim/GlobalInternals.h"
 #include "EventLoopTask.h"
 #include "NodeModuleModule.h"
+#include "NodeURLHelpers.h"
 #include <JavaScriptCore/JSCBytecodeCacheVersion.h>
 #include "JSPerformanceServerTiming.h"
 #include "JSPerformanceResourceTiming.h"
@@ -3565,7 +3566,12 @@ JSC::Identifier GlobalObject::moduleLoaderResolve(JSGlobalObject* jsGlobalObject
         if (moduleName->startsWith("file://"_s)) {
             auto url = WTF::URL(moduleName);
             if (url.isValid() && !url.isEmpty()) {
-                keyString = url.fileSystemPath();
+                auto path = url.fileSystemPath();
+                if (!path) {
+                    Bun::throwURIMalformed(scope, globalObject);
+                    return {};
+                }
+                keyString = WTF::move(*path);
             } else {
                 keyString = moduleName;
             }
@@ -3675,7 +3681,7 @@ JSC::JSPromise* GlobalObject::moduleLoaderImportModule(JSGlobalObject* jsGlobalO
     if (sourceURL.isEmpty()) {
         sourceOriginStringHolder = String("."_s);
     } else if (sourceURL.protocolIsFile()) {
-        sourceOriginStringHolder = sourceURL.fileSystemPath();
+        sourceOriginStringHolder = Bun::fileSystemPathOfInternalURL(sourceURL);
         auto query = sourceURL.queryWithLeadingQuestionMark();
         auto referrerKey = query.isEmpty()
             ? JSC::Identifier::fromString(vm, sourceOriginStringHolder)

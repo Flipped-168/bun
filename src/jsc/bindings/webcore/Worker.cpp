@@ -65,17 +65,20 @@ Worker::Worker(ScriptExecutionContext& context, WorkerOptions&& options)
 {
 }
 
-ExceptionOr<Ref<Worker>> Worker::create(ScriptExecutionContext& context, const String& urlInit, WorkerOptions&& options)
+ExceptionOr<void> Worker::convertFileURLToPath(String& urlOrPath)
+{
+    if (!urlOrPath.startsWith("file://"_s))
+        return {};
+    auto path = WTF::URL { urlOrPath }.fileSystemPath();
+    if (!path)
+        return Exception { TypeError, makeString("Invalid file URL: \""_s, urlOrPath, '"') };
+    urlOrPath = WTF::move(*path);
+    return {};
+}
+
+ExceptionOr<Ref<Worker>> Worker::create(ScriptExecutionContext& context, const String& url, WorkerOptions&& options)
 {
     ASSERT(context.isContextThread());
-
-    String url = urlInit;
-    if (url.startsWith("file://"_s)) {
-        WTF::URL urlObject { url };
-        if (!urlObject.isValid())
-            return Exception { TypeError, makeString("Invalid file URL: \""_s, urlInit, '"') };
-        url = urlObject.fileSystemPath();
-    }
 
     auto worker = adoptRef(*new Worker(context, WTF::move(options)));
     worker->suspendIfNeeded();

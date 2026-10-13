@@ -1518,6 +1518,37 @@ const sqliteProtocols = [
   { prefix: "file:", stripLength: 5 },
 ];
 
+// Whether Bun.fileURLToPath() can percent-decode `escapes`, one or more "%XX", to UTF-8.
+function decodesToUTF8(escapes: string): boolean {
+  try {
+    Bun.fileURLToPath("file:///" + escapes);
+  } catch (error) {
+    return !(error instanceof URIError);
+  }
+  return true;
+}
+
+// A "%" of a file name can make an escape that is not UTF-8: "50%deposit.db" has "%de".
+// Puts "%25" for each such "%", so that Bun.fileURLToPath() keeps the text of the name.
+function escapeUndecodableEscapes(url: string): string {
+  return url.replace(/(?:%[0-9a-f]{2})+/gi, run => {
+    let escaped = "";
+    for (let start = 0; start < run.length; ) {
+      // A UTF-8 sequence has 1 to 4 bytes, and none is the start of a longer one.
+      let end = start + 3;
+      while (end <= run.length && end - start <= 12 && !decodesToUTF8(run.slice(start, end))) end += 3;
+      if (end <= run.length && end - start <= 12) {
+        escaped += run.slice(start, end);
+        start = end;
+      } else {
+        escaped += "%25" + run.slice(start + 1, start + 3);
+        start += 3;
+      }
+    }
+    return escaped;
+  });
+}
+
 function parseDefinitelySqliteUrl(value: string | URL | null): string | null {
   if (value === null) return null;
   const str = value instanceof URL ? value.toString() : value;
@@ -1532,7 +1563,12 @@ function parseDefinitelySqliteUrl(value: string | URL | null): string | null {
     if (stripLength === -1) {
       try {
         return Bun.fileURLToPath(str);
-      } catch {
+      } catch (error) {
+        if (error instanceof URIError) {
+          try {
+            return Bun.fileURLToPath(escapeUndecodableEscapes(str));
+          } catch {}
+        }
         // if it cant pass it's probably query string, we can just strip it
         // slicing off the file:// at the beginning
         return str.slice(7);

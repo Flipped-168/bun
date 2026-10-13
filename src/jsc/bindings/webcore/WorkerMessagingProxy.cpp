@@ -124,15 +124,8 @@ ExceptionOr<void> WorkerMessagingProxy::startWorkerGlobalScope(const String& scr
 
     Vector<BunString> preloadModules;
     preloadModules.reserveInitialCapacity(m_options.preloadModules.size());
-    for (auto& str : m_options.preloadModules) {
-        if (str.startsWith("file://"_s)) {
-            WTF::URL urlObject = WTF::URL(str);
-            if (!urlObject.isValid())
-                return Exception { TypeError, makeString("Invalid file URL: \""_s, str, '"') };
-            str = urlObject.fileSystemPath();
-        }
+    for (auto& str : m_options.preloadModules)
         preloadModules.append(Bun::toString(str));
-    }
 
     static_assert(sizeof(WTF::String) == sizeof(WTF::StringImpl*));
     std::span<WTF::StringImpl*> execArgv = m_options.execArgv

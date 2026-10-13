@@ -48,7 +48,10 @@ class Worker final : public RefCounted<Worker>, public EventTargetWithInlineData
     WTF_MAKE_TZONE_ALLOCATED(Worker);
 
 public:
+    // `url` and the preload modules are paths by now, see convertFileURLToPath().
     static ExceptionOr<Ref<Worker>> create(ScriptExecutionContext&, const String& url, WorkerOptions&&);
+    // Replaces a "file://" URL with its path. The exception is for a URL that has no path.
+    static ExceptionOr<void> convertFileURLToPath(String& urlOrPath);
     ~Worker();
 
     // ActiveDOMObject.

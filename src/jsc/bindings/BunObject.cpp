@@ -42,6 +42,7 @@
 #include "_NativeModule.h"
 #include "JSCookie.h"
 #include "JSCookieMap.h"
+#include "NodeURLHelpers.h"
 #include "Secrets.h"
 
 #ifdef WIN32
@@ -861,47 +862,32 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
         url = domURL->href();
     }
 
-    /// cannot turn non-`file://` URLs into file paths
-    if (!url.protocolIsFile()) [[unlikely]] {
-        Bun::ERR::INVALID_URL_SCHEME(scope, globalObject, "file"_s);
-        return {};
-    }
-
-// NOTE: On Windows, WTF::URL::fileSystemPath will handle UNC paths
-// (`file:\\server\share\etc` -> `\\server\share\etc`), so hostname check only
-// needs to happen on posix systems
-#if !OS(WINDOWS)
-    // file://host/path is illegal if `host` is not `localhost`.
-    // Should be `file:///` instead
-    if (url.host().length() > 0 && url.host() != "localhost"_s) [[unlikely]] {
-
+    WTF::String fileSystemPath;
+    if (auto error = Bun::fileURLToPath(url, fileSystemPath)) {
+        switch (*error) {
+        case Bun::FileURLToPathError::NotFileURL:
+            Bun::ERR::INVALID_URL_SCHEME(scope, globalObject, "file"_s);
+            break;
+        case Bun::FileURLToPathError::InvalidHost:
 #if OS(DARWIN)
-        Bun::ERR::INVALID_FILE_URL_HOST(scope, globalObject, "darwin"_s);
-        return {};
+            Bun::ERR::INVALID_FILE_URL_HOST(scope, globalObject, "darwin"_s);
 #else
-        Bun::ERR::INVALID_FILE_URL_HOST(scope, globalObject, "linux"_s);
-        return {};
+            Bun::ERR::INVALID_FILE_URL_HOST(scope, globalObject, "linux"_s);
 #endif
-    }
-#endif
-
-    // ban url-encoded slashes. '/' on posix, '/' and '\' on windows.
-    const StringView p = url.path();
-    if (p.contains('%')) {
+            break;
+        case Bun::FileURLToPathError::InvalidPath:
 #if OS(WINDOWS)
-        if (p.contains("%2f"_s) || p.contains("%5c"_s) || p.contains("%2F"_s) || p.contains("%5C"_s)) {
             Bun::ERR::INVALID_FILE_URL_PATH(scope, globalObject, "must not include encoded \\ or / characters"_s);
-            return {};
-        }
 #else
-        if (p.contains("%2f"_s) || p.contains("%2F"_s)) {
             Bun::ERR::INVALID_FILE_URL_PATH(scope, globalObject, "must not include encoded / characters"_s);
-            return {};
-        }
 #endif
+            break;
+        case Bun::FileURLToPathError::Undecodable:
+            Bun::throwURIMalformed(scope, globalObject);
+            break;
+        }
+        return {};
     }
-
-    auto fileSystemPath = url.fileSystemPath();
 
 #if OS(WINDOWS)
     if (!isAbsolutePath(fileSystemPath)) {

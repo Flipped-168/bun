@@ -115,6 +115,58 @@ bool hasValidPunycodeHost(WTF::StringView host)
     return !icuToASCII(host.toString(), IDNAMode::Default).isNull();
 }
 
+// `%2f` or `%2F`, and on Windows `%5c` or `%5C`.
+static bool hasEncodedPathSeparator(StringView path)
+{
+    for (size_t i = path.find('%'); i != notFound && i + 2 < path.length(); i = path.find('%', i + 1)) {
+        const char16_t second = path[i + 1];
+        const char16_t third = path[i + 2] | 0x20;
+        if (second == '2' && third == 'f')
+            return true;
+#if OS(WINDOWS)
+        if (second == '5' && third == 'c')
+            return true;
+#endif
+    }
+    return false;
+}
+
+std::optional<FileURLToPathError> fileURLToPath(const WTF::URL& url, WTF::String& path)
+{
+    if (!url.protocolIsFile())
+        return FileURLToPathError::NotFileURL;
+#if !OS(WINDOWS)
+    // On Windows the host is the server of a UNC path.
+    if (!url.host().isEmpty())
+        return FileURLToPathError::InvalidHost;
+#endif
+    if (hasEncodedPathSeparator(url.path()))
+        return FileURLToPathError::InvalidPath;
+    auto decoded = url.fileSystemPath();
+    if (!decoded)
+        return FileURLToPathError::Undecodable;
+    path = WTF::move(*decoded);
+    return std::nullopt;
+}
+
+// V8's message for decodeURIComponent(). JSC's is "URI error".
+extern "C" JSC::EncodedJSValue Bun__createURIMalformedError(JSC::JSGlobalObject* globalObject)
+{
+    return JSC::JSValue::encode(JSC::createURIError(globalObject, "URI malformed"_s));
+}
+
+void throwURIMalformed(JSC::ThrowScope& scope, JSC::JSGlobalObject* globalObject)
+{
+    scope.throwException(globalObject, JSC::JSValue::decode(Bun__createURIMalformedError(globalObject)));
+}
+
+WTF::String fileSystemPathOfInternalURL(const WTF::URL& url)
+{
+    auto path = url.fileSystemPath();
+    ASSERT(path || !url.protocolIsFile());
+    return WTF::move(path).unsafeValue();
+}
+
 // Mirrors Node's url.domainToASCII/domainToUnicode, which run the input
 // through a WHATWG URL host parse (ada's url.set_hostname on a "ws://x"
 // base). Returns a null String when host parsing fails.
