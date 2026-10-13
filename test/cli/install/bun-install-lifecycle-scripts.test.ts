@@ -4144,6 +4144,98 @@ for (const forceWaiterThread of isLinux ? [false, true] : [false]) {
         expect(exited).toBe(128 + signal);
       },
     );
+
+    // A failed script of an optional dependency does not fail the install, whatever ended
+    // the script: an exit code or a signal. `kill -<SIG> $$` ends the shell itself, so bun
+    // sees the signal and not an exit code. Windows has no POSIX signals.
+    describe.skipIf(isWindows).each(["hoisted", "isolated"] as const)(
+      "a failed script of a dependency (%s)",
+      linker => {
+        const scriptNames = ["preinstall", "install", "postinstall"] as const;
+        const mark = (name: string) => `echo > "$INIT_CWD/${name}.ran"`;
+
+        // `dep` is the package under test. `other` is a required package that must not be affected.
+        async function install(kind: "dependencies" | "optionalDependencies", scripts: Record<string, string>) {
+          using ctx = await setupTest();
+          const { packageDir, packageJson, env } = ctx;
+          const testEnv = forceWaiterThread ? { ...env, BUN_FEATURE_FLAG_FORCE_WAITER_THREAD: "1" } : env;
+
+          const edge = { dep: "file:./dep" };
+          await Promise.all([
+            write(
+              packageJson,
+              JSON.stringify({
+                name: "foo",
+                version: "1.0.0",
+                dependencies: { other: "file:./other", ...(kind === "dependencies" ? edge : {}) },
+                optionalDependencies: kind === "optionalDependencies" ? edge : {},
+                trustedDependencies: ["dep", "other"],
+              }),
+            ),
+            write(join(packageDir, "dep", "package.json"), JSON.stringify({ name: "dep", version: "1.0.0", scripts })),
+            write(
+              join(packageDir, "other", "package.json"),
+              JSON.stringify({ name: "other", version: "1.0.0", scripts: { postinstall: mark("other-postinstall") } }),
+            ),
+          ]);
+
+          await using proc = spawn({
+            cmd: [bunExe(), "install", `--linker=${linker}`],
+            cwd: packageDir,
+            stdout: "pipe",
+            stderr: "pipe",
+            env: testEnv,
+          });
+          const [, stderr, exited] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+          const [files, lockfile, dep, other] = await Promise.all([
+            readdirSorted(packageDir),
+            exists(join(packageDir, "bun.lock")),
+            exists(join(packageDir, "node_modules", "dep", "package.json")),
+            exists(join(packageDir, "node_modules", "other", "package.json")),
+          ]);
+          const ran = files.filter(name => name.endsWith(".ran")).map(name => name.slice(0, -".ran".length));
+          return { stderr, exited, ran, lockfile, installed: { dep, other } };
+        }
+
+        test.each([
+          ["preinstall", "kill -KILL $$"],
+          ["install", "kill -TERM $$"],
+          ["postinstall", "ulimit -c 0; kill -SEGV $$"],
+          ["postinstall", "kill -INT $$"],
+          ["postinstall", "exit 1"],
+        ] as const)("optional: %s ends by `%s` and the package is skipped", async (failing, how) => {
+          const scripts: Record<string, string> = {};
+          for (const name of scriptNames) {
+            scripts[name] = mark(name) + (name === failing ? `; ${how}` : "");
+          }
+
+          const { stderr, ...result } = await install("optionalDependencies", scripts);
+
+          expect(stderr).not.toContain("error:");
+          expect(result).toEqual({
+            // The scripts after the failed one do not run.
+            ran: [...scriptNames.slice(0, scriptNames.indexOf(failing) + 1), "other-postinstall"].sort(),
+            lockfile: true,
+            installed: { dep: false, other: true },
+            exited: 0,
+          });
+        });
+
+        test("required: a script killed by a signal ends the install with that signal", async () => {
+          const { stderr, exited } = await install("dependencies", { postinstall: "kill -KILL $$" });
+
+          expect(stderr).toContain('error: postinstall script from "dep" terminated by SIGKILL');
+          expect(exited).toBe(128 + osConstants.signals.SIGKILL);
+        });
+
+        test("required: a script that exits with a code ends the install with that code", async () => {
+          const { stderr, exited } = await install("dependencies", { postinstall: "exit 3" });
+
+          expect(stderr).toContain('error: postinstall script from "dep" exited with 3');
+          expect(exited).toBe(3);
+        });
+      },
+    );
   });
 
   describe.concurrent("stdout/stderr is inherited from root scripts during install", async () => {

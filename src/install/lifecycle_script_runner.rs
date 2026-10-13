@@ -842,20 +842,29 @@ impl<'a> LifecycleScriptSubprocess<'a> {
         // fields (`heap`/`manager`) — see `ensure_not_in_heap` doc.
         unsafe { Self::ensure_not_in_heap(std::ptr::from_mut::<Self>(self)) };
 
+        // A failed script of an optional dependency does not fail the install, whatever ended it.
+        if self.optional {
+            let failed = match &status {
+                Status::Exited(exit) => exit.code > 0,
+                Status::Signaled(_) | Status::Err(_) => true,
+                Status::Running => false,
+            };
+            if failed {
+                if let Some(ctx) = &self.ctx {
+                    let installer = ctx.installer_mut();
+                    installer.store.entries.items_step()[ctx.entry_id.get() as usize]
+                        .store(Step::Done as u32, Ordering::Release);
+                    installer.on_task_complete(ctx.entry_id, CompleteState::Skipped);
+                }
+                self.decrement_pending_script_tasks();
+                self.deinit_and_delete_package();
+                return;
+            }
+        }
+
         match status {
             Status::Exited(exit) => {
                 if exit.code > 0 {
-                    if self.optional {
-                        if let Some(ctx) = &self.ctx {
-                            let installer = ctx.installer_mut();
-                            installer.store.entries.items_step()[ctx.entry_id.get() as usize]
-                                .store(Step::Done as u32, Ordering::Release);
-                            installer.on_task_complete(ctx.entry_id, CompleteState::Skipped);
-                        }
-                        self.decrement_pending_script_tasks();
-                        self.deinit_and_delete_package();
-                        return;
-                    }
                     self.print_output();
                     bun_core::pretty_errorln!(
                         "<r><red>error<r><d>:<r> <b>{}<r> script from \"<b>{}<r>\" exited with {}<r>",
@@ -972,18 +981,6 @@ impl<'a> LifecycleScriptSubprocess<'a> {
                 Global::raise_ignoring_panic_handler_raw(core::ffi::c_int::from(signal));
             }
             Status::Err(err) => {
-                if self.optional {
-                    if let Some(ctx) = &self.ctx {
-                        let installer = ctx.installer_mut();
-                        installer.store.entries.items_step()[ctx.entry_id.get() as usize]
-                            .store(Step::Done as u32, Ordering::Release);
-                        installer.on_task_complete(ctx.entry_id, CompleteState::Skipped);
-                    }
-                    self.decrement_pending_script_tasks();
-                    self.deinit_and_delete_package();
-                    return;
-                }
-
                 bun_core::pretty_errorln!(
                     "<r><red>error<r>: Failed to run <b>{}<r> script from \"<b>{}<r>\" due to\n{}",
                     bstr::BStr::new(self.script_name()),
