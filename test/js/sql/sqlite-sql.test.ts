@@ -1416,6 +1416,206 @@ describe("Transactions", () => {
     // Both updates of every second transaction are kept.
     expect(outcomes.map(({ balance }) => balance)).toEqual(outcomes.map((_, hops) => 500 + 2 * (hops + 1)));
   });
+
+  // SQLite rolls the whole transaction back inside a statement that fails with one of these.
+  describe("a transaction that SQLite rolled back by itself", () => {
+    const refused = "ERR_SQLITE_INVALID_TRANSACTION_STATE";
+    const primaryKey = "SQLITE_CONSTRAINT_PRIMARYKEY";
+    const triggers = [
+      {
+        name: "ON CONFLICT ROLLBACK",
+        k: "id INTEGER PRIMARY KEY ON CONFLICT ROLLBACK",
+        conflict: "INSERT INTO k VALUES (1)",
+        code: primaryKey,
+      },
+      {
+        name: "INSERT OR ROLLBACK",
+        k: "id INTEGER PRIMARY KEY",
+        conflict: "INSERT OR ROLLBACK INTO k VALUES (1)",
+        code: primaryKey,
+      },
+      {
+        name: "UPDATE OR ROLLBACK",
+        k: "id INTEGER PRIMARY KEY",
+        conflict: "UPDATE OR ROLLBACK k SET id = 1 WHERE id = 2",
+        code: primaryKey,
+      },
+      {
+        name: "RAISE(ROLLBACK)",
+        k: "id INTEGER PRIMARY KEY",
+        conflict: "INSERT INTO k VALUES (3)",
+        code: "SQLITE_CONSTRAINT_TRIGGER",
+      },
+    ];
+
+    async function open(k: string) {
+      const db = new SQL("sqlite://:memory:");
+      await db.unsafe(`CREATE TABLE k (${k})`);
+      await db`INSERT INTO k VALUES (1), (2)`;
+      await db`CREATE TRIGGER three BEFORE INSERT ON k WHEN new.id = 3 BEGIN SELECT RAISE(ROLLBACK, 'no three'); END`;
+      await db`CREATE TABLE t (v TEXT)`;
+      await db`INSERT INTO t VALUES ('seed')`;
+      return db;
+    }
+    const settle = (promise: Promise<unknown>) =>
+      promise.then(
+        () => "fulfilled",
+        e => e.code ?? e.message,
+      );
+    // What the file holds, and whether the connection takes a new transaction.
+    async function after(db: SQL) {
+      const rows = await db`SELECT v FROM t ORDER BY rowid`;
+      return { rows: rows.map(row => row.v), next: await settle(db.begin(async () => {})) };
+    }
+    const clean = { rows: ["seed"], next: "fulfilled" };
+
+    describe.each(triggers)("$name", ({ k, conflict, code }) => {
+      test("a conflict that the callback does not catch rejects begin() with its error", async () => {
+        await using db = await open(k);
+        const begin = await settle(
+          db.begin(async tx => {
+            await tx`INSERT INTO t VALUES ('first')`;
+            await tx.unsafe(conflict);
+          }),
+        );
+        expect({ begin, ...(await after(db)) }).toEqual({ begin: code, ...clean });
+      });
+
+      test("a statement after a caught conflict is refused", async () => {
+        await using db = await open(k);
+        const begin = await settle(
+          db.begin(async tx => {
+            await tx`INSERT INTO t VALUES ('first')`;
+            await tx.unsafe(conflict).catch(() => {});
+            await tx`INSERT INTO t VALUES ('second')`;
+          }),
+        );
+        expect({ begin, ...(await after(db)) }).toEqual({ begin: refused, ...clean });
+      });
+
+      test("begin() rejects when the callback catches every error and returns", async () => {
+        await using db = await open(k);
+        const begin = await settle(
+          db.begin(async tx => {
+            await tx`INSERT INTO t VALUES ('first')`;
+            await tx.unsafe(conflict).catch(() => {});
+            await tx`INSERT INTO t VALUES ('second')`.catch(() => {});
+          }),
+        );
+        expect({ begin, ...(await after(db)) }).toEqual({ begin: refused, ...clean });
+      });
+
+      test("a conflict inside a savepoint rejects the savepoint with its error", async () => {
+        await using db = await open(k);
+        let savepoint: string | undefined;
+        const begin = await settle(
+          db.begin(async tx => {
+            await tx`INSERT INTO t VALUES ('first')`;
+            savepoint = await settle(tx.savepoint(sp => sp.unsafe(conflict)));
+            await tx`INSERT INTO t VALUES ('second')`;
+          }),
+        );
+        expect({ savepoint, begin, ...(await after(db)) }).toEqual({ savepoint: code, begin: refused, ...clean });
+      });
+
+      test("the queries of an array after the conflict are refused", async () => {
+        await using db = await open(k);
+        const begin = await settle(
+          db.begin(tx => [
+            tx`INSERT INTO t VALUES ('first')`,
+            tx.unsafe(conflict),
+            tx`INSERT INTO t VALUES ('second')`,
+          ]),
+        );
+        expect({ begin, ...(await after(db)) }).toEqual({ begin: code, ...clean });
+      });
+    });
+
+    test("a savepoint after the rollback is refused and its callback does not run", async () => {
+      await using db = await open("id INTEGER PRIMARY KEY");
+      let ran = false;
+      const begin = await settle(
+        db.begin(async tx => {
+          await tx`INSERT OR ROLLBACK INTO k VALUES (1)`.catch(() => {});
+          await tx.savepoint(async sp => {
+            ran = true;
+            await sp`INSERT INTO t VALUES ('in the savepoint')`;
+          });
+        }),
+      );
+      expect({ ran, begin, ...(await after(db)) }).toEqual({ ran: false, begin: refused, ...clean });
+    });
+
+    test("tx.close() after the rollback sends no ROLLBACK", async () => {
+      await using db = await open("id INTEGER PRIMARY KEY");
+      let close: string | undefined;
+      await settle(
+        db.begin(async tx => {
+          await tx`INSERT OR ROLLBACK INTO k VALUES (1)`.catch(() => {});
+          close = await settle(tx.close());
+        }),
+      );
+      expect({ close, ...(await after(db)) }).toEqual({ close: "fulfilled", ...clean });
+    });
+
+    test("a conflict of a statement on the instance ends the transaction of begin() too", async () => {
+      await using db = await open("id INTEGER PRIMARY KEY");
+      const begin = await settle(
+        db.begin(async tx => {
+          await tx`INSERT INTO t VALUES ('first')`;
+          await db`INSERT OR ROLLBACK INTO k VALUES (1)`.catch(() => {});
+          await tx`INSERT INTO t VALUES ('second')`;
+        }),
+      );
+      expect({ begin, ...(await after(db)) }).toEqual({ begin: refused, ...clean });
+    });
+
+    test("a statement of a begin() that ended its transaction does not run inside the next begin()", async () => {
+      await using db = await open("id INTEGER PRIMARY KEY");
+      const started = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let second: Promise<string> | undefined;
+      let late: string | undefined;
+      const first = await settle(
+        db.begin(async tx => {
+          await tx.unsafe("COMMIT");
+          second = settle(
+            db.begin(async tx2 => {
+              await tx2`INSERT INTO t VALUES ('in the second')`;
+              started.resolve();
+              await release.promise;
+            }),
+          );
+          await started.promise;
+          late = await settle(tx`INSERT INTO t VALUES ('late')`);
+          release.resolve();
+        }),
+      );
+      expect({ late, first, second: await second, ...(await after(db)) }).toEqual({
+        late: refused,
+        first: refused,
+        second: "fulfilled",
+        rows: ["seed", "in the second"],
+        next: "fulfilled",
+      });
+    });
+
+    test("a constraint error that ends only its statement leaves the transaction open", async () => {
+      await using db = await open("id INTEGER PRIMARY KEY");
+      const begin = await settle(
+        db.begin(async tx => {
+          await tx`INSERT INTO t VALUES ('first')`;
+          await tx`INSERT INTO k VALUES (1)`.catch(() => {});
+          await tx`INSERT INTO t VALUES ('second')`;
+        }),
+      );
+      expect({ begin, ...(await after(db)) }).toEqual({
+        begin: "fulfilled",
+        rows: ["seed", "first", "second"],
+        next: "fulfilled",
+      });
+    });
+  });
 });
 
 describe("SQLite-specific features", () => {

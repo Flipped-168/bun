@@ -219,7 +219,9 @@ const SQL = function SQL(
     if (pool.transaction !== transactionQueries && !err && !query.cancelled) {
       transactionQueries.delete(query);
       return query.reject(
-        pool.invalidTransactionStateError("cannot run a query: the transaction of this sql.begin() is no longer active"),
+        pool.invalidTransactionStateError(
+          "cannot run a query: the transaction of this sql.begin() is no longer active",
+        ),
       );
     }
     if (queryFromTransactionHandler.$call(this, transactionQueries, query, handle, err)) {
@@ -240,7 +242,10 @@ const SQL = function SQL(
 
   // Rolls back in the call where COMMIT failed: the runner resumes after other statements of the connection ran.
   function commitFromTransactionHandler(transactionQueries, query, handle, err) {
-    if (transactionHandler.$call(this, transactionQueries, query, handle, err) && !lostTransaction(transactionQueries)) {
+    if (
+      transactionHandler.$call(this, transactionQueries, query, handle, err) &&
+      !lostTransaction(transactionQueries)
+    ) {
       pool.rollbackFailedCommit!(this);
     }
   }
@@ -951,7 +956,11 @@ const SQL = function SQL(
       return resolve(transaction_result);
     } catch (err) {
       try {
-        if (!(state.connectionState & ReservedConnectionState.closed) && needs_rollback && !lostTransaction(state.queries)) {
+        if (
+          !(state.connectionState & ReservedConnectionState.closed) &&
+          needs_rollback &&
+          !lostTransaction(state.queries)
+        ) {
           if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
             await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
           }
