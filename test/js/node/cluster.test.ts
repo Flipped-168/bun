@@ -1445,7 +1445,8 @@ if (cluster.isPrimary) {
         distinctListeningPorts: new Set(shared.map(worker => listeningPorts[worker.id])).size,
         listeningMatchesReported: shared.every(worker => listeningPorts[worker.id] === worker.port),
         exclusiveWorkerHasOwnPort: exclusive.port > 0 && exclusive.port !== port,
-        exclusiveListeningMatchesReported: listeningPorts[exclusive.id] === exclusive.port,
+        // As in node, a worker that binds its own socket does not report 'listening' to the primary.
+        exclusiveNotifiedPrimary: exclusive.id in listeningPorts,
         served,
       }),
     );
@@ -1488,7 +1489,7 @@ test.skipIf(isWindows).each(["http", "https"])(
         distinctListeningPorts: 1,
         listeningMatchesReported: true,
         exclusiveWorkerHasOwnPort: true,
-        exclusiveListeningMatchesReported: true,
+        exclusiveNotifiedPrimary: false,
         served: 4,
       },
       stderr: expect.any(String),
@@ -1814,12 +1815,21 @@ const cluster = require("node:cluster");
 const http = require("node:http");
 
 if (cluster.isPrimary) {
-  let listening;
-  cluster.on("listening", (_worker, address) => (listening = address));
-  const worker = cluster.fork();
-  worker.on("message", ({ error, bound }) => {
-    console.log(JSON.stringify({ error, listening: listening && { address: listening.address, addressType: listening.addressType }, bound }));
+  // The worker's listen callback sends its message before the worker reports 'listening', as in node.
+  let listening, result;
+  const done = () => {
+    if (result === undefined || (listening === undefined && result.error === undefined)) return;
+    console.log(JSON.stringify({ ...result, listening }));
     worker.process.kill();
+  };
+  cluster.on("listening", (_worker, address) => {
+    listening = { address: address.address, addressType: address.addressType };
+    done();
+  });
+  const worker = cluster.fork();
+  worker.on("message", message => {
+    result = message;
+    done();
   });
 } else {
   const server = http.createServer();
@@ -1850,8 +1860,8 @@ test.skipIf(isWindows || !isIPv6())(
   "http worker listen(0, '[::1]') binds ::1 through the primary",
   async () => {
     expect(await runHttpHostFormFixture("[::1]")).toEqual({
-      listening: { address: "::1", addressType: 6 },
       bound: { address: "::1", family: "IPv6", hasPort: true },
+      listening: { address: "::1", addressType: 6 },
     });
   },
   30_000,
@@ -1870,8 +1880,8 @@ test.skipIf(isWindows)(
   async () => {
     const out = await runHttpHostFormFixture("localhost");
     expect(out).toEqual({
-      listening: { address: out.bound.address, addressType: out.bound.family === "IPv6" ? 6 : 4 },
       bound: { address: expect.any(String), family: expect.stringMatching(/^IPv[46]$/), hasPort: true },
+      listening: { address: out.bound.address, addressType: out.bound.family === "IPv6" ? 6 : 4 },
     });
     expect(net.isIP(out.bound.address)).toBeGreaterThan(0);
   },
