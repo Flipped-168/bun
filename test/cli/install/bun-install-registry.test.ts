@@ -3251,7 +3251,7 @@ describe("binaries", () => {
   // A package names its commands in `bin`. When an installed package changes to a version that
   // declares other commands, the links of the commands it no longer declares have to go.
   describe.concurrent("a version change that drops bins", () => {
-    type Version = { bin?: Record<string, string>; files: string[] };
+    type Version = { bin?: Record<string, string>; directories?: { bin: string }; files: string[] };
     const packages: Record<string, Record<string, Version>> = {
       "tool-a": {
         "1.0.0": {
@@ -3271,6 +3271,11 @@ describe("binaries", () => {
         "1.0.0": { bin: { "old-only": "bin/b.js", "tool-b": "bin/b.js" }, files: ["bin/b.js"] },
         "2.0.0": { bin: { "tool-b": "bin/b.js" }, files: ["bin/b.js"] },
       },
+      // Every file of a `directories.bin` folder is a command.
+      "tool-d": {
+        "1.0.0": { directories: { bin: "cmds" }, files: ["cmds/d-one", "cmds/d-two"] },
+        "2.0.0": { directories: { bin: "cmds" }, files: ["cmds/d-one"] },
+      },
     };
     const v1 = ["old-only", "renamed-v1", "tool-a"];
     const v2 = ["new-only", "renamed-v2", "tool-a"];
@@ -3278,8 +3283,10 @@ describe("binaries", () => {
 
     beforeAll(async () => {
       for (const [name, versions] of Object.entries(packages)) {
-        for (const [version, { bin, files }] of Object.entries(versions)) {
-          const archive: Record<string, string> = { "package/package.json": JSON.stringify({ name, version, bin }) };
+        for (const [version, { files, ...fields }] of Object.entries(versions)) {
+          const archive: Record<string, string> = {
+            "package/package.json": JSON.stringify({ name, version, ...fields }),
+          };
           for (const path of files) {
             archive[`package/${path}`] = `#!/usr/bin/env node\nconsole.log("${name}@${version} ${path}");\n`;
           }
@@ -3303,9 +3310,9 @@ describe("binaries", () => {
             name,
             "dist-tags": { latest: versions.at(-1)![0] },
             versions: Object.fromEntries(
-              versions.map(([version, { bin }]) => [
+              versions.map(([version, { files, ...fields }]) => [
                 version,
-                { name, version, bin, dist: { tarball: `${origin}/${name}-${version}.tgz` } },
+                { name, version, ...fields, dist: { tarball: `${origin}/${name}-${version}.tgz` } },
               ]),
             ),
           });
@@ -3431,6 +3438,22 @@ describe("binaries", () => {
         const [rootBinsAfter, workspaceBinsAfter] = await bins();
         expect(rootBinsAfter).toHaveBins(v1);
         expect(workspaceBinsAfter).toHaveBins(["tool-a"]);
+      });
+
+      test(`a \`directories.bin\` folder that loses a file (${linker})`, async () => {
+        await using registry = serveRegistry();
+        using dir = projectDir(registry.url.href, linker);
+        const cwd = String(dir);
+        const bins = () => readdirSorted(binDirOf(cwd));
+
+        await install(cwd, { "tool-d": "1.0.0" });
+        expect(await bins()).toHaveBins(["d-one", "d-two"]);
+
+        await install(cwd, { "tool-d": "2.0.0" });
+        expect(await bins()).toHaveBins(["d-one"]);
+
+        await install(cwd, { "tool-d": "1.0.0" });
+        expect(await bins()).toHaveBins(["d-one", "d-two"]);
       });
 
       test(`a name that two packages declare (${linker})`, async () => {
