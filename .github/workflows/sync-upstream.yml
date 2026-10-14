@@ -5,7 +5,6 @@ on:
   workflow_dispatch:
 permissions:
   contents: write
-  workflows: write
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -22,6 +21,13 @@ jobs:
       - name: Fetch upstream
         run: git fetch upstream
       - name: Merge upstream
-        run: git merge upstream/HEAD || git merge FETCH_HEAD
+        run: git merge upstream/HEAD --no-edit || git merge FETCH_HEAD --no-edit
+      - name: Preserve fork workflow files
+        run: |
+          git checkout HEAD^1 -- .github/workflows
+          git add .github/workflows
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
       - name: Push
         run: git push
