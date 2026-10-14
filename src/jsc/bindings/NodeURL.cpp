@@ -115,8 +115,7 @@ bool hasValidPunycodeHost(WTF::StringView host)
     return !icuToASCII(host.toString(), IDNAMode::Default).isNull();
 }
 
-// `%2f` or `%2F`, and on Windows `%5c` or `%5C`.
-static bool hasEncodedPathSeparator(StringView path)
+bool hasEncodedPathSeparator(WTF::StringView path)
 {
     for (size_t i = path.find('%'); i != notFound && i + 2 < path.length(); i = path.find('%', i + 1)) {
         const char16_t second = path[i + 1];
@@ -129,24 +128,6 @@ static bool hasEncodedPathSeparator(StringView path)
 #endif
     }
     return false;
-}
-
-std::optional<FileURLToPathError> fileURLToPath(const WTF::URL& url, WTF::String& path)
-{
-    if (!url.protocolIsFile())
-        return FileURLToPathError::NotFileURL;
-#if !OS(WINDOWS)
-    // On Windows the host is the server of a UNC path.
-    if (!url.host().isEmpty())
-        return FileURLToPathError::InvalidHost;
-#endif
-    if (hasEncodedPathSeparator(url.path()))
-        return FileURLToPathError::InvalidPath;
-    auto decoded = url.fileSystemPath();
-    if (!decoded)
-        return FileURLToPathError::Undecodable;
-    path = WTF::move(*decoded);
-    return std::nullopt;
 }
 
 // V8's message for decodeURIComponent(). JSC's is "URI error".

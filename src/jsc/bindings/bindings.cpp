@@ -2672,12 +2672,10 @@ WebCore::DOMURL* WebCore__DOMURL__cast_(JSC::EncodedJSValue JSValue0, JSC::VM* v
 
 BunString WebCore__DOMURL__fileSystemPath(WebCore::DOMURL* arg0, Bun::FileURLToPathError* error)
 {
-    WTF::String path;
-    if (auto failed = Bun::fileURLToPath(arg0->href(), path)) {
-        *error = *failed;
+    auto path = Bun::fileURLToPath(arg0->href(), *error);
+    if (!path)
         return BunString { BunStringTag::Dead, nullptr };
-    }
-    return Bun::toStringRef(path);
+    return Bun::toStringRef(*path);
 }
 
 // Taken from unwrapBoxedPrimitive in JSONObject.cpp in WebKit

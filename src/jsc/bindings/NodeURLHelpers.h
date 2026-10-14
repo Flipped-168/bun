@@ -5,8 +5,7 @@
 // ZigGlobalObject.h via NodeURL.h.
 
 #include <cstdint>
-#include <optional>
-#include <wtf/Forward.h>
+#include <wtf/URL.h>
 
 namespace JSC {
 class JSGlobalObject;
@@ -28,9 +27,34 @@ enum class FileURLToPathError : uint8_t {
     Undecodable = 3,
 };
 
-// Node's fileURLToPath() for the host platform, in Node's order of checks. Sets `path` when there is no error.
+// `%2f` or `%2F` in a path that has a "%", and on Windows `%5c` or `%5C`.
+bool hasEncodedPathSeparator(WTF::StringView path);
+
+// Node's fileURLToPath() for the host platform, in Node's order of checks. Sets `error` when the result is empty.
 // https://github.com/nodejs/node/blob/v26.3.0/lib/internal/url.js#L1622-L1631
-std::optional<FileURLToPathError> fileURLToPath(const WTF::URL&, WTF::String& path);
+ALWAYS_INLINE WTF::Markable<WTF::String> fileURLToPath(const WTF::URL& url, FileURLToPathError& error)
+{
+    if (!url.protocolIsFile()) {
+        error = FileURLToPathError::NotFileURL;
+        return {};
+    }
+#if !OS(WINDOWS)
+    // On Windows the host is the server of a UNC path.
+    if (!url.host().isEmpty()) {
+        error = FileURLToPathError::InvalidHost;
+        return {};
+    }
+#endif
+    const WTF::StringView encodedPath = url.path();
+    if (encodedPath.contains('%') && hasEncodedPathSeparator(encodedPath)) {
+        error = FileURLToPathError::InvalidPath;
+        return {};
+    }
+    auto path = url.fileSystemPath();
+    if (!path)
+        error = FileURLToPathError::Undecodable;
+    return path;
+}
 
 // What Node's fileURLToPath() throws for `Undecodable`. It has no `code`, so it is not ERR_INVALID_URI.
 void throwURIMalformed(JSC::ThrowScope&, JSC::JSGlobalObject*);

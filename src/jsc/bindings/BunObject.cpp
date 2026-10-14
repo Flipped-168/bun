@@ -862,9 +862,10 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
         url = domURL->href();
     }
 
-    WTF::String fileSystemPath;
-    if (auto error = Bun::fileURLToPath(url, fileSystemPath)) {
-        switch (*error) {
+    Bun::FileURLToPathError error;
+    auto fileSystemPath = Bun::fileURLToPath(url, error);
+    if (!fileSystemPath) {
+        switch (error) {
         case Bun::FileURLToPathError::NotFileURL:
             Bun::ERR::INVALID_URL_SCHEME(scope, globalObject, "file"_s);
             break;
@@ -890,13 +891,13 @@ JSC_DEFINE_HOST_FUNCTION(functionFileURLToPath, (JSC::JSGlobalObject * globalObj
     }
 
 #if OS(WINDOWS)
-    if (!isAbsolutePath(fileSystemPath)) {
+    if (!isAbsolutePath(*fileSystemPath)) {
         Bun::ERR::INVALID_FILE_URL_PATH(scope, globalObject, "must be an absolute path"_s);
         return {};
     }
 #endif
 
-    return JSC::JSValue::encode(JSC::jsString(vm, fileSystemPath));
+    return JSC::JSValue::encode(JSC::jsString(vm, WTF::move(*fileSystemPath)));
 }
 
 /* Source for BunObject.lut.h
