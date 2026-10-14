@@ -18,7 +18,8 @@ use bun_threading::{ThreadPool, WaitGroup};
 use crate::package_installer::NodeModulesFolder;
 use crate::{
     BuntagHashBuf, Lockfile, Npm, PackageID, PackageManager, Repository, Resolution,
-    TruncatedPackageNameHash, bun_fs, bun_json, buntaghashbuf_make, initialize_store, resolution,
+    TruncatedPackageNameHash, bin, bun_fs, bun_json, buntaghashbuf_make, initialize_store,
+    resolution,
 };
 
 bun_output::declare_scope!(install, hidden);
@@ -42,6 +43,10 @@ pub struct PackageInstall<'a> {
 
     pub(crate) node_modules: &'a NodeModulesFolder,
     pub lockfile: &'a Lockfile,
+
+    /// The commands of the version that `uninstall_before_install` moved out
+    /// of the way. The caller unlinks the ones that the new version drops.
+    pub(crate) retired_bins: bin::RetiredBins,
 }
 
 #[derive(Clone, Copy)]
@@ -1930,7 +1935,7 @@ impl<'a> PackageInstall<'a> {
         Ok(InstallResult::Success)
     }
 
-    pub(crate) fn uninstall_before_install(&self, destination_dir: &Dir) {
+    pub(crate) fn uninstall_before_install(&mut self, destination_dir: &Dir) {
         let mut rand_path_buf = [0u8; 48];
         let rand_bytes = bun_core::fast_random().to_ne_bytes();
         let temp_path = {
@@ -1954,6 +1959,13 @@ impl<'a> PackageInstall<'a> {
                 // if it fails, that means the directory doesn't exist or was inaccessible
             }
             Ok(_) => {
+                // Before the task below deletes the package.json.
+                self.retired_bins = bin::RetiredBins::read(
+                    destination_dir.fd(),
+                    temp_path.as_bytes(),
+                    self.destination_dir_subpath.as_bytes(),
+                );
+
                 // Uninstall can sometimes take awhile in a large directory
                 // tree. Since we're renaming the directory to a randomly
                 // generated name, we can delete it in another thread without

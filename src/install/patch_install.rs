@@ -489,6 +489,7 @@ impl PatchTask {
             // dummy value
             node_modules: &dummy_node_modules,
             lockfile,
+            retired_bins: Default::default(),
         };
 
         match pkg_install.install(

@@ -31,8 +31,13 @@ impl Symlinker {
         }
     }
 
-    // Ok(true) when a link was written.
-    pub(crate) fn ensure_symlink(&mut self, strategy: Strategy) -> bun_sys::Result<bool> {
+    // Ok(true) when a link was written. `before_replace` gets `dest` while a
+    // link to another target is still in place.
+    pub(crate) fn ensure_symlink(
+        &mut self,
+        strategy: Strategy,
+        before_replace: impl FnOnce(&[u8]),
+    ) -> bun_sys::Result<bool> {
         match strategy {
             Strategy::ExpectMissing => {
                 return match self.symlink() {
@@ -118,12 +123,14 @@ impl Symlinker {
                 }
 
                 #[cfg(windows)]
-                {
-                    if strings::eql_long(current_link, self.fallback_junction_target.slice(), true)
-                    {
-                        return Ok(false);
-                    }
+                if strings::eql_long(current_link, self.fallback_junction_target.slice(), true) {
+                    return Ok(false);
+                }
 
+                before_replace(self.dest.slice());
+
+                #[cfg(windows)]
+                {
                     // this existing link is pointing to the wrong package.
                     // on windows rmdir must be used for symlinks created to point
                     // at directories, even if the target no longer exists

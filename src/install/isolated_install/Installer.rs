@@ -2177,7 +2177,7 @@ impl<'a> Installer<'a> {
             symlinker::Strategy::ExpectExisting
         };
 
-        let _ = symlinker.ensure_symlink(link_strategy);
+        let _ = symlinker.ensure_symlink(link_strategy, |_| {});
     }
 
     fn maybe_replace_node_modules_path(
@@ -2264,7 +2264,9 @@ impl<'a> Installer<'a> {
 
             dest.set_length(base_len);
             let _ = dest.append(dep_name); // OOM/capacity: fire-and-forget
-            if entry_node_modules_name.is_some_and(|name| strings::eql_long(dep_name, name, true)) {
+            let is_nested =
+                entry_node_modules_name.is_some_and(|name| strings::eql_long(dep_name, name, true));
+            if is_nested {
                 // same name as the entry itself: nest one node_modules deeper to avoid the collision
                 let _ = dest.append(b"node_modules"); // OOM/capacity: fire-and-forget
                 let _ = dest.append(dep_name); // OOM/capacity: fire-and-forget
@@ -2289,9 +2291,28 @@ impl<'a> Installer<'a> {
                 #[cfg(windows)]
                 fallback_junction_target: dep_store_path.into_sep::<{ PathSeparators::ANY }>(),
             };
-            let result = symlinker.ensure_symlink(strategy);
+            // The link still leads to the version that this one replaces.
+            let mut retired_bins = bin::RetiredBins::default();
+            let result = symlinker.ensure_symlink(strategy, |dest| {
+                if !is_nested {
+                    retired_bins = bin::RetiredBins::read(Fd::cwd(), dest, dep_name);
+                }
+            });
             dest = symlinker.dest.into_sep::<{ PathSeparators::AUTO }>();
             changed |= result?;
+
+            if !retired_bins.is_empty() {
+                let dep_node_id = self.store.entries.items_node_id()[dep.entry_id.get() as usize];
+                let dep_pkg_id = self.store.nodes.items_pkg_id()[dep_node_id.get() as usize];
+                retired_bins.unlink_undeclared(
+                    &lockfile.packages.items_bin()[dep_pkg_id as usize],
+                    string_buf,
+                    lockfile.buffers.extern_strings.as_slice(),
+                    &dest.slice()[..base_len],
+                    dep_name,
+                    None,
+                );
+            }
         }
 
         Ok(changed)

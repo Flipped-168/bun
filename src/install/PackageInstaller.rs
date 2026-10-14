@@ -1399,6 +1399,7 @@ impl<'a> PackageInstaller<'a> {
             // site stays safe.
             lockfile: self.lockfile(),
             cache_dir_subpath: ZStr::EMPTY,
+            retired_bins: bin::RetiredBins::default(),
         };
         bun_output::scoped_log!(
             PackageInstaller,
@@ -1907,6 +1908,20 @@ impl<'a> PackageInstaller<'a> {
 
                     if log_level.show_progress() {
                         self.node.complete_one();
+                    }
+
+                    if !installer.retired_bins.is_empty() {
+                        let options = &self.manager().options;
+                        installer.retired_bins.unlink_undeclared(
+                            &self.bins[package_id as usize],
+                            string_buf!(),
+                            self.lockfile().buffers.extern_strings.as_slice(),
+                            self.node_modules.path.as_slice(),
+                            alias.slice(string_buf!()),
+                            // Only the root tree of a global install links into the global bin dir.
+                            (options.global && self.current_tree_id == 0)
+                                .then(|| options.bin_path.as_bytes()),
+                        );
                     }
 
                     if self.bins[package_id as usize].tag != bin::Tag::None {
