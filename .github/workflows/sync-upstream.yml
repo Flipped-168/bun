@@ -20,14 +20,15 @@ jobs:
         run: git remote add upstream https://github.com/oven-sh/bun.git || true
       - name: Fetch upstream
         run: git fetch upstream
-      - name: Merge upstream
-        run: git merge upstream/HEAD --no-edit || git merge FETCH_HEAD --no-edit
-      - name: Preserve fork workflow files
+      - name: Merge upstream (ours strategy)
         run: |
-          git checkout HEAD^1 -- .github/workflows
+          git merge upstream/HEAD --no-edit -X ours || git merge FETCH_HEAD --no-edit -X ours
+      - name: Keep only our workflow
+        run: |
+          mkdir -p .github/workflows
+          find .github/workflows -type f ! -name "sync-upstream.yml" -delete
+      - name: Commit and push
+        run: |
           git add .github/workflows
-          if ! git diff --cached --quiet; then
-            git commit --amend --no-edit
-          fi
-      - name: Push
-        run: git push
+          git commit -m "chore: preserve fork sync workflow" --allow-empty
+          git push
