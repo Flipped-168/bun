@@ -1,4 +1,4 @@
-name: Sync upstream
+name: Sync oven-sh/bun
 on:
   schedule:
     - cron: '0 2 * * *'
@@ -16,19 +16,26 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-      - name: Add upstream
-        run: git remote add upstream https://github.com/oven-sh/bun.git || true
-      - name: Fetch upstream
-        run: git fetch upstream
-      - name: Merge upstream (ours strategy)
+      - name: Add oven-sh/bun
+        run: git remote add oven-sh/bun https://github.com/oven-sh/bun.git || true
+      - name: Fetch oven-sh/bun
+        run: git fetch oven-sh/bun
+      - name: Merge oven-sh/bun (ours strategy)
         run: |
-          git merge upstream/HEAD --no-edit -X ours || git merge FETCH_HEAD --no-edit -X ours
+          git merge oven-sh/bun/HEAD --no-edit -X ours || git merge FETCH_HEAD --no-edit -X ours || true
+          git diff --name-only --diff-filter=U | while IFS= read -r f; do
+            case "$f" in
+              .github/workflows/sync-oven-sh/bun.yml) ;;
+              .github/workflows/*) git rm -f "$f" ;;
+              *) git checkout --ours -- "$f" || true ;;
+            esac
+          done
       - name: Keep only our workflow
         run: |
           mkdir -p .github/workflows
-          find .github/workflows -type f ! -name "sync-upstream.yml" -delete
+          find .github/workflows -type f ! -name "sync-oven-sh/bun.yml" -delete
       - name: Commit and push
         run: |
-          git add .github/workflows
+          git add -f .github/workflows
           git commit -m "chore: preserve fork sync workflow" --allow-empty
           git push
